@@ -1,0 +1,25 @@
+# Secrets & env
+.env
+
+# Database
+bot.db
+bot.db-shm
+bot.db-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
