@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 from html import escape
 from typing import Any, Dict, List, Optional
 
@@ -165,6 +166,35 @@ def normalize_package(package: Dict[str, Any], lesson_id: str = "") -> Dict[str,
     data["practice"] = normalize_quiz(data.get("practice", []), lesson_id, "p", 12)
     data["exam"] = normalize_quiz(data.get("exam", []), lesson_id, "e", 8)
     return data
+
+
+def shuffle_mcq(question: Dict[str, Any], rng: Optional[random.Random] = None) -> Dict[str, Any]:
+    """Return a normalized question with shuffled options and corrected index."""
+    rng = rng or random.SystemRandom()
+    q = normalize_mcq(question)
+    options = list(q.get("options", []))
+    correct = safe_correct_idx(q)
+    pairs = list(enumerate(options))
+    rng.shuffle(pairs)
+    q["options"] = [opt for _, opt in pairs]
+    q["correct"] = next((new_i for new_i, (old_i, _) in enumerate(pairs) if old_i == correct), 0)
+    return q
+
+
+def build_quiz_attempt(
+    items: Any,
+    lesson_id: str = "",
+    kind: str = "q",
+    limit: Optional[int] = None,
+    *,
+    seed: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Build one randomized quiz attempt: question order and options both change."""
+    rng = random.Random(seed) if seed is not None else random.SystemRandom()
+    tasks = normalize_quiz(items, lesson_id, kind, limit)
+    tasks = [shuffle_mcq(q, rng) for q in tasks]
+    rng.shuffle(tasks)
+    return tasks
 
 
 def add_quiz_result(results_json: str, question: Dict[str, Any], chosen_idx: int) -> str:

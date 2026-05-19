@@ -108,8 +108,8 @@ TAG_TO_RECOMMEND: Dict[str, List[str]] = {
     "conjugation": ["s2_03", "s2_04"],
     "aspect":      ["s2_03"],
     "participle":  ["s2_07", "s2_08"],
-    "syntax":      ["s3_02", "s3_04", "s3_10", "s3_11"],
-    "punctuation": ["s3_10", "s3_11"],
+    "syntax":      ["s2_09", "s2_10", "s3_02", "s3_04", "s3_10", "s3_11"],
+    "punctuation": ["s2_09", "s2_10", "s3_10", "s3_11"],
     "vocab":       ["s1_02", "s1_03"],
     "literature":  ["s1_07", "s1_13"],
 }
@@ -152,4 +152,3 @@ def load_custom_lessons_from_db():
             register_custom_lesson(t["lesson_id"], t["name"], semester=t.get("semester", CUSTOM_SEMESTER))
     except Exception:
         pass  # DB might not be initialized yet
-

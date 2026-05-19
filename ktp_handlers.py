@@ -1,6 +1,7 @@
 # ktp_handlers.py — KTP curriculum flow: theory → practice → exam → writing
 from __future__ import annotations
 
+import json
 from typing import Dict, Any, List, Optional
 
 import storage
@@ -8,6 +9,7 @@ from ktp_plan import KTP_LESSONS, LESSON_BY_ID, semester_lessons, TAG_TO_RECOMME
 from ai import predefined_ktp_package, generate_ktp_package_via_ai, evaluate_writing_full
 from quiz_utils import (
     add_quiz_result,
+    build_quiz_attempt,
     build_answer_review,
     normalize_package,
     safe_correct_idx as _quiz_safe_correct_idx,
@@ -59,15 +61,17 @@ def _get_or_generate_package(lesson_id: str) -> Dict[str, Any]:
     Returns a lesson package. If OpenAI isn't configured and the lesson isn't cached,
     returns a safe placeholder package (so the bot never crashes).
     """
-    # 1) cache (uploaded by admin)
+    # 1) handcrafted/system. Keep critical lessons stable even if an older
+    # generated version was cached in the DB.
+    pack = predefined_ktp_package(lesson_id)
+    if pack:
+        return normalize_package(pack, lesson_id)
+
+    # 2) cache (uploaded by admin / generated earlier)
     cached = storage.get_ktp_cache(lesson_id)
     if cached:
         return normalize_package(cached, lesson_id)
 
-    # 2) handcrafted/system
-    pack = predefined_ktp_package(lesson_id)
-    if pack:
-        return normalize_package(pack, lesson_id)
     # 3) generate via AI
     meta = LESSON_BY_ID.get(lesson_id)
     if not meta:
@@ -124,6 +128,46 @@ def register(bot):
             safe_delete(chat_id, old)
             storage.clear_progress_key(uid, "last_status_msg")
 
+    def _store_attempt_tasks(uid: int, tasks: List[Dict[str, Any]]) -> None:
+        storage.set_progress(uid, "ktp_tasks_json", json.dumps(tasks, ensure_ascii=False))
+
+    def _load_attempt_tasks(uid: int, lesson_id: str, kind: str) -> List[Dict[str, Any]]:
+        raw = storage.get_progress(uid, "ktp_tasks_json", "")
+        if raw:
+            try:
+                tasks = json.loads(raw)
+                if isinstance(tasks, list):
+                    return tasks
+            except Exception:
+                pass
+        pack = _get_or_generate_package(lesson_id)
+        return pack.get("practice" if kind == "p" else "exam") or []
+
+    def _build_vocab_text(lesson_id: str) -> str:
+        pack = _get_or_generate_package(lesson_id)
+        vocab = pack.get("vocab") or []
+        if not vocab:
+            return "🃏 <b>Словарик</b>\n\nПока нет словарика для этого урока."
+        lines = []
+        for ru, uz in vocab[:14]:
+            lines.append(f"• <b>{safe_html(ru)}</b> — <i>{safe_html(uz)}</i>")
+        return "🃏 <b>Словарик (Л.Т.)</b>\n\n" + "\n".join(lines)
+
+    def _show_write_prompt(chat_id: int, message_id: int, uid: int, lesson_id: str) -> None:
+        pack = _get_or_generate_package(lesson_id)
+        prompt = pack.get("writing_prompt") or "Напиши 6–8 предложений по теме урока."
+        storage.set_progress(uid, "mode", "awaiting_ktp_text")
+        storage.set_progress(uid, "ktp_write_lesson", lesson_id)
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("🃏 Словарик", callback_data=f"ktp:write_vocab:{lesson_id}"))
+        kb.add(InlineKeyboardButton("❌ Отмена", callback_data=f"ktp:write_cancel:{lesson_id}"))
+        kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
+        bot.edit_message_text(
+            f"{prompt}\n\n"
+            "<i>Отправь ответ одним сообщением. Можно открыть словарик и вернуться сюда: режим письма сохранится.</i>",
+            chat_id, message_id, reply_markup=kb, parse_mode="HTML"
+        )
+
     def kb_semesters(uid: int):
         kb = InlineKeyboardMarkup(row_width=1)
         for sem in [1, 2, 3]:
@@ -141,6 +185,7 @@ def register(bot):
             if lessons:
                 done = sum(1 for l in lessons if storage.get_ktp_progress(uid, l.lesson_id).get("done"))
                 kb.add(InlineKeyboardButton(f"📄 Семестр {sem} ({done}/{len(lessons)})", callback_data=f"ktp:sem:{sem}"))
+        kb.add(InlineKeyboardButton("📈 Мой прогресс", callback_data="ktp:progress"))
         kb.add(InlineKeyboardButton("📊 Мои ошибки", callback_data="home:errors"))
         kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
         return kb
@@ -190,6 +235,59 @@ def register(bot):
             parse_mode="HTML",
         )
 
+    @bot.callback_query_handler(func=lambda c: c.data == "ktp:progress")
+    def on_progress(call):
+        bot.answer_callback_query(call.id)
+        uid = call.from_user.id
+        user = storage.get_user(uid) or {}
+        total_lessons = len(KTP_LESSONS)
+        done_total = 0
+        writing_attempts = 0
+        started = []
+        lines = [
+            "📈 <b>Мой прогресс</b>",
+            f"XP: <b>{int(user.get('xp') or 0)}</b>",
+            f"Уровень: <b>{safe_html(user.get('language_level') or 'NA')}</b>",
+            "",
+        ]
+
+        for sem in sorted({l.semester for l in KTP_LESSONS}):
+            lessons = semester_lessons(sem)
+            done = 0
+            exam_sum = 0
+            exam_count = 0
+            for lesson in lessons:
+                p = storage.get_ktp_progress(uid, lesson.lesson_id)
+                done += 1 if int(p.get("done") or 0) else 0
+                writing_attempts += int(p.get("writing_attempts") or 0)
+                best_exam = int(p.get("exam_best") or 0)
+                if best_exam:
+                    exam_sum += best_exam
+                    exam_count += 1
+                if (best_exam or int(p.get("practice_best") or 0) or int(p.get("writing_best") or 0)) and not p.get("done"):
+                    started.append((lesson, p))
+            done_total += done
+            avg_exam = round(exam_sum / exam_count, 1) if exam_count else 0
+            lines.append(f"Семестр {sem}: <b>{done}/{len(lessons)}</b> уроков · ср. контроль <b>{avg_exam}</b>")
+
+        lines.append("")
+        lines.append(f"Всего пройдено: <b>{done_total}/{total_lessons}</b>")
+        lines.append(f"Письменных попыток: <b>{writing_attempts}</b>")
+
+        if started:
+            lines.append("\n<b>В работе:</b>")
+            for lesson, p in started[:5]:
+                lines.append(
+                    f"• {lesson.num}. {safe_html(lesson.title[:42])}: "
+                    f"практ. {p.get('practice_best',0)} · контр. {p.get('exam_best',0)} · письмо {p.get('writing_best',0)}/5"
+                )
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("📘 К семестрам", callback_data="menu:ktp"))
+        kb.add(InlineKeyboardButton("📊 Мои ошибки", callback_data="home:errors"))
+        kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
+        bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:lesson:"))
     def on_lesson(call):
         bot.answer_callback_query(call.id)
@@ -230,18 +328,25 @@ def register(bot):
         meta = LESSON_BY_ID.get(lesson_id)
         if not meta:
             return
-        pack = _get_or_generate_package(lesson_id)
-        vocab = pack.get("vocab") or []
-        if not vocab:
-            txt = "🃏 <b>Словарик</b>\n\nПока нет словарика для этого урока."
-        else:
-            lines = []
-            for ru, uz in vocab[:14]:
-                lines.append(f"• <b>{ru}</b> — <i>{uz}</i>")
-            txt = "🃏 <b>Словарик (Л.Т.)</b>\n\n" + "\n".join(lines)
+        txt = _build_vocab_text(lesson_id)
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
         bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:write_vocab:"))
+    def on_write_vocab(call):
+        bot.answer_callback_query(call.id)
+        uid = call.from_user.id
+        lesson_id = call.data.split(":")[2]
+        storage.set_progress(uid, "mode", "awaiting_ktp_text")
+        storage.set_progress(uid, "ktp_write_lesson", lesson_id)
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("✍️ К письму", callback_data=f"ktp:write_back:{lesson_id}"))
+        kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
+        bot.edit_message_text(
+            _build_vocab_text(lesson_id) + "\n\n<i>Письмо не отменено: можно вернуться и отправить текст.</i>",
+            call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML"
+        )
 
     # ── Practice flow ─────────────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:practice_start:"))
@@ -250,7 +355,7 @@ def register(bot):
         uid = call.from_user.id
         lesson_id = call.data.split(":")[2]
         pack = _get_or_generate_package(lesson_id)
-        tasks = pack.get("practice") or []
+        tasks = build_quiz_attempt(pack.get("practice") or [], lesson_id, "p", 12)
         if not tasks:
             bot.answer_callback_query(call.id, "Нет заданий.", show_alert=True)
             return
@@ -259,6 +364,7 @@ def register(bot):
         storage.set_progress(uid, "ktp_idx", "0")
         storage.set_progress(uid, "ktp_correct", "0")
         storage.set_progress(uid, "ktp_results", "[]")
+        _store_attempt_tasks(uid, tasks)
         _send_mcq(call.message.chat.id, call.message.message_id, uid, tasks, lesson_id, kind="p")
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:exam_start:"))
@@ -267,7 +373,7 @@ def register(bot):
         uid = call.from_user.id
         lesson_id = call.data.split(":")[2]
         pack = _get_or_generate_package(lesson_id)
-        tasks = pack.get("exam") or []
+        tasks = build_quiz_attempt(pack.get("exam") or [], lesson_id, "e", 8)
         if not tasks:
             bot.answer_callback_query(call.id, "Нет контрольной.", show_alert=True)
             return
@@ -276,6 +382,7 @@ def register(bot):
         storage.set_progress(uid, "ktp_idx", "0")
         storage.set_progress(uid, "ktp_correct", "0")
         storage.set_progress(uid, "ktp_results", "[]")
+        _store_attempt_tasks(uid, tasks)
         _send_mcq(call.message.chat.id, call.message.message_id, uid, tasks, lesson_id, kind="e")
 
     def _send_mcq(chat_id: int, msg_id: int, uid: int, tasks: List[Dict[str, Any]], lesson_id: str, kind: str):
@@ -305,8 +412,7 @@ def register(bot):
             return
         _, _, lesson_id, idx_s, kind = call.data.split(":")
         idx = int(idx_s)
-        pack = _get_or_generate_package(lesson_id)
-        tasks = pack.get("practice" if kind == "p" else "exam") or []
+        tasks = _load_attempt_tasks(uid, lesson_id, kind)
         if idx >= len(tasks):
             bot.answer_callback_query(call.id)
             return
@@ -327,8 +433,7 @@ def register(bot):
             bot.answer_callback_query(call.id, "Сессия не активна.")
             return
 
-        pack = _get_or_generate_package(lesson_id)
-        tasks = pack.get("practice" if kind == "p" else "exam") or []
+        tasks = _load_attempt_tasks(uid, lesson_id, kind)
         cur = int(storage.get_progress(uid, "ktp_idx", "0") or 0)
         if idx != cur:
             bot.answer_callback_query(call.id, "Продолжай по порядку.")
@@ -339,7 +444,6 @@ def register(bot):
         if ok:
             c = int(storage.get_progress(uid, "ktp_correct", "0") or 0) + 1
             storage.set_progress(uid, "ktp_correct", str(c))
-            storage.add_xp(uid, 2 if kind == "p" else 3)
 
         # track errors for wrong answers (tag)
         if not ok and t.get("tag"):
@@ -361,6 +465,14 @@ def register(bot):
         total = len(tasks)
         storage.set_progress(uid, "mode", "idle")
 
+        pass_mark = exam_pass_threshold(total)
+        prev = storage.get_ktp_progress(uid, lesson_id)
+        prev_best_key = "practice_best" if kind == "p" else "exam_best"
+        prev_best = int(prev.get(prev_best_key) or 0)
+        was_passed = kind == "e" and prev_best >= pass_mark
+        improvement = max(0, correct - prev_best)
+        xp_awarded = improvement * (2 if kind == "p" else 3)
+
         if kind == "p":
             storage.upsert_ktp_progress(uid, lesson_id, practice_score=correct)
         else:
@@ -369,10 +481,11 @@ def register(bot):
         pct = int(correct / max(1, total) * 100)
         grade = "🌟 Отлично!" if pct >= 90 else ("👍 Хорошо!" if pct >= 70 else ("😊 Неплохо!" if pct >= 50 else "💪 Повтори тему!"))
 
-        pass_mark = exam_pass_threshold(total)
         passed = (kind == "e" and correct >= pass_mark)
-        if passed:
-            storage.add_xp(uid, 25)
+        if passed and not was_passed:
+            xp_awarded += 25
+        if xp_awarded:
+            storage.add_xp(uid, xp_awarded)
 
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
@@ -386,6 +499,11 @@ def register(bot):
         if kind == "e":
             extra = "✅ Урок засчитан!" if passed else f"Нужно ≥{pass_mark}/{total}, чтобы зачесть урок."
         extra_block = f"\n\n{extra}" if extra else ""
+        xp_line = (
+            f"\n🎁 <b>+{xp_awarded} XP</b> за новый лучший результат"
+            if xp_awarded else
+            "\n🎁 XP не начислен: повтор без улучшения лучшего результата."
+        )
         review = build_answer_review(
             tasks,
             storage.get_progress(uid, "ktp_results", "[]"),
@@ -393,7 +511,7 @@ def register(bot):
             max_all=total,
         )
         bot.edit_message_text(
-            f"🎉 <b>{title}</b>\n\nПравильных: <b>{correct}/{total}</b>\n{grade}{extra_block}{review}",
+            f"🎉 <b>{title}</b>\n\nПравильных: <b>{correct}/{total}</b>\n{grade}{extra_block}{xp_line}{review}",
             chat_id, msg_id, reply_markup=kb, parse_mode="HTML"
         )
 
@@ -413,18 +531,17 @@ def register(bot):
         meta = LESSON_BY_ID.get(lesson_id)
         if not meta:
             return
-        pack = _get_or_generate_package(lesson_id)
-        prompt = pack.get("writing_prompt") or "Напиши 6–8 предложений по теме урока."
         storage.clear_progress_prefix(uid, "ktp_write_")
-        storage.set_progress(uid, "mode", "awaiting_ktp_text")
-        storage.set_progress(uid, "ktp_write_lesson", lesson_id)
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("❌ Отмена", callback_data=f"ktp:write_cancel:{lesson_id}"))
-        kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
-        bot.edit_message_text(
-            f"{prompt}\n\n<i>Отправь ответ одним сообщением. Если передумал — нажми «Отмена» или /start.</i>",
-            call.message.chat.id, call.message.message_id, reply_markup=kb, parse_mode="HTML"
-        )
+        _show_write_prompt(call.message.chat.id, call.message.message_id, uid, lesson_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:write_back:"))
+    def on_write_back(call):
+        bot.answer_callback_query(call.id)
+        uid = call.from_user.id
+        lesson_id = call.data.split(":")[2]
+        if lesson_id not in LESSON_BY_ID:
+            return
+        _show_write_prompt(call.message.chat.id, call.message.message_id, uid, lesson_id)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:write_cancel:"))
     def on_write_cancel(call):
@@ -442,7 +559,6 @@ def register(bot):
         text = (msg.text or "").strip()
         lesson_id = storage.get_progress(uid, "ktp_write_lesson", "")
         meta = LESSON_BY_ID.get(lesson_id)
-        safe_delete(msg.chat.id, msg.message_id)
         if not meta or not text:
             storage.set_progress(uid, "mode", "idle")
             storage.clear_progress_prefix(uid, "ktp_write_")
@@ -487,12 +603,21 @@ def register(bot):
         storage.track_errors(uid, tags)
 
         overall = int(result.get("score", 1) or 1)
+        prev_progress = storage.get_ktp_progress(uid, lesson_id)
+        prev_writing_best = int(prev_progress.get("writing_best") or 0)
+        first_writing = int(prev_progress.get("writing_attempts") or 0) == 0
         storage.upsert_ktp_progress(uid, lesson_id, writing_score=overall)
 
-        # XP: reward by overall + sub-scores
+        # XP is awarded for the first writing attempt or for improving the best score.
         scores = result.get("scores") or {}
-        xp = 10 + int(scores.get("overall", overall)) * 3 + int(scores.get("coherence", 1))
-        storage.add_xp(uid, xp)
+        if first_writing:
+            xp = 10 + int(scores.get("overall", overall)) * 3 + int(scores.get("coherence", 1))
+        elif overall > prev_writing_best:
+            xp = (overall - prev_writing_best) * 5
+        else:
+            xp = 0
+        if xp:
+            storage.add_xp(uid, xp)
 
         # mark done if exam passed
         p = storage.get_ktp_progress(uid, lesson_id)
@@ -506,11 +631,12 @@ def register(bot):
 
         exp = result.get("explanations", [])[:6]
         tips = result.get("tips", [])[:4]
-        expl_text = "\n".join([f"• {x}" for x in exp]) if exp else "• Всё хорошо, продолжай!"
-        tips_text = "\n".join([f"✅ {x}" for x in tips]) if tips else ""
+        expl_text = "\n".join([f"• {safe_html(x)}" for x in exp]) if exp else "• Всё хорошо, продолжай!"
+        tips_text = "\n".join([f"✅ {safe_html(x)}" for x in tips]) if tips else ""
 
         corrected = result.get("corrected_text", "").strip()
-        corrected_block = f"\n\n<b>Исправленный вариант:</b>\n{truncate_text(corrected, 1200)}" if corrected else ""
+        original_block = f"<b>Текст ученика:</b>\n{truncate_text(safe_html(text), 1200)}"
+        corrected_block = f"\n\n<b>Исправленный вариант:</b>\n{truncate_text(safe_html(corrected), 1200)}" if corrected else ""
 
         # Recommendations: what to repeat (based on tags)
         rec_lessons = []
@@ -525,9 +651,11 @@ def register(bot):
             for lid in rec_lessons:
                 lm = LESSON_BY_ID.get(lid)
                 if lm:
-                    names.append(f"• {lm.title}")
+                    names.append(f"• {safe_html(lm.title)}")
             if names:
                 rec_text = "\n\n<b>Что повторить:</b>\n" + "\n".join(names)
+
+        xp_text = f"🎁 +{xp} XP" if xp else "🎁 XP не начислен: результат не улучшил лучший балл."
 
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
@@ -538,12 +666,13 @@ def register(bot):
             msg.chat.id,
             f"✅ <b>Проверка готова</b>\n\n"
             f"{score_line}\n\n"
+            f"{original_block}\n\n"
             f"<b>Комментарии:</b>\n{expl_text}"
             + (f"\n\n<b>Советы:</b>\n{tips_text}" if tips_text else "")
             + corrected_block
             + rec_text
-            + f"\n\n🧠 Мини‑задание: {result.get('next_micro_task','')}\n"
-            f"🎁 +{xp} XP",
+            + f"\n\n🧠 Мини‑задание: {safe_html(result.get('next_micro_task',''))}\n"
+            f"{xp_text}",
             parse_mode="HTML",
             reply_markup=kb,
         )

@@ -14,7 +14,7 @@ from ktp_plan import TAG_TO_RECOMMEND, LESSON_BY_ID, load_custom_lessons_from_db
 from content import TEST_QUESTIONS, MODULES, MODULE_ORDER, ACHIEVEMENTS
 from ai import evaluate_morphology_writing
 from quiz_utils import add_quiz_result, build_answer_review, safe_correct_idx, safe_html
-from utils import format_tags, format_error_stats, label, TAG_LABELS
+from utils import format_tags, format_error_stats, label, TAG_LABELS, truncate_text
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -445,6 +445,7 @@ def start_test(call):
     storage.set_progress(uid, "test_idx", "0")
     storage.set_progress(uid, "test_score", "0")
     storage.set_progress(uid, "test_results", "[]")
+    storage.set_progress(uid, "test_award_xp", "0" if "first_test" in storage.get_achievements(uid) else "1")
     _send_test_q(call.message.chat.id, call.message.message_id, uid)
 
 def _send_test_q(chat_id, msg_id, uid):
@@ -472,7 +473,10 @@ def on_test_ans(call):
     correct_idx = safe_correct_idx(q)
     ok = chosen == correct_idx
     sc = int(storage.get_progress(uid, "test_score", "0"))
-    if ok: sc += 1; storage.add_xp(uid, 2)
+    if ok:
+        sc += 1
+        if storage.get_progress(uid, "test_award_xp", "1") == "1":
+            storage.add_xp(uid, 2)
     storage.set_progress(uid, "test_score", str(sc))
     storage.set_progress(
         uid,
@@ -556,6 +560,7 @@ def on_tasks_start(call):
     storage.set_progress(uid, "lesson_task_idx", "0")
     storage.set_progress(uid, "lesson_correct", "0")
     storage.set_progress(uid, "lesson_results", "[]")
+    storage.set_progress(uid, "lesson_award_xp", "0" if storage.is_level_tasks_done(uid, mid, lvl) else "1")
     _send_task(call.message.chat.id, call.message.message_id, uid, mid, lvl)
 
 def _send_task(chat_id, msg_id, uid, mid, lvl):
@@ -602,7 +607,8 @@ def on_task_ans(call):
     correct_idx = safe_correct_idx(task)
     ok = chosen == correct_idx
     if ok:
-        storage.add_xp(uid, task.get("xp", {1:5,2:10,3:15}[lvl]))
+        if storage.get_progress(uid, "lesson_award_xp", "1") == "1":
+            storage.add_xp(uid, task.get("xp", {1:5,2:10,3:15}[lvl]))
         c = int(storage.get_progress(uid, "lesson_correct", "0")) + 1
         storage.set_progress(uid, "lesson_correct", str(c))
     storage.set_progress(
@@ -691,9 +697,6 @@ def on_open_text(msg):
     except Exception:
         lvl = 1
 
-    # Keep the private chat clean: remove the student's submitted text if possible.
-    safe_delete(msg.chat.id, msg.message_id)
-
     if not text or mid not in MODULES:
         storage.clear_progress_prefix(uid, "open_")
         storage.set_progress(uid, "mode", "idle")
@@ -717,8 +720,18 @@ def on_open_text(msg):
 
     tags = result.get("error_tags", [])
     storage.track_errors(uid, tags)
-    xp = 10 + result.get("score", 1) * 2
-    storage.add_xp(uid, xp)
+    result_score = int(result.get("score", 1) or 1)
+    best_key = f"open_best_{mid}_{lvl}"
+    try:
+        prev_best = int(storage.get_progress(uid, best_key, "-1"))
+    except Exception:
+        prev_best = -1
+    if result_score > prev_best:
+        xp = 10 + result_score * 2
+        storage.set_progress(uid, best_key, str(result_score))
+        storage.add_xp(uid, xp)
+    else:
+        xp = 0
     if "no_error" in tags:
         maybe_unlock(uid, "no_spelling")
     update_meta(uid)
@@ -731,18 +744,20 @@ def on_open_text(msg):
     exps = result.get("explanations", [])
     if not isinstance(exps, list):
         exps = [str(exps)]
-    exp_txt = "\n".join(f"• {x}" for x in exps[:4]) or "• Ошибок нет!"
+    exp_txt = "\n".join(f"• {safe_html(x)}" for x in exps[:4]) or "• Ошибок нет!"
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📝 К контрольной", callback_data=f"ctrl:start:{mid}:{lvl}"))
     kb.add(InlineKeyboardButton(f"⬅️ К уровню", callback_data=f"level:{mid}:{lvl}"))
     bot.send_message(msg.chat.id,
         "🤖 <b>Обратная связь от ИИ</b>\n\n"
-        f"💬 {result.get('praise','')}\n\n"
-        f"✍️ <b>Исправленный вариант:</b>\n{result.get('corrected_text','—')}\n\n"
+        f"💬 {safe_html(result.get('praise',''))}\n\n"
+        f"🧾 <b>Текст ученика:</b>\n{truncate_text(safe_html(text), 900)}\n\n"
+        f"✍️ <b>Исправленный вариант:</b>\n{safe_html(result.get('corrected_text','—'))}\n\n"
         f"📌 <b>Разбор:</b>\n{exp_txt}\n\n"
         f"{score_line}\n\n"
-        f"🎯 <b>Совет:</b> {result.get('next_micro_task','')}\n\n"
-        f"🏷 <b>Ошибки:</b> {format_tags(tags)} | ⭐ <b>+{xp} XP</b>",
+        f"🎯 <b>Совет:</b> {safe_html(result.get('next_micro_task',''))}\n\n"
+        f"🏷 <b>Ошибки:</b> {format_tags(tags)} | "
+        + (f"⭐ <b>+{xp} XP</b>" if xp else "⭐ XP не начислен: результат не улучшил лучший балл."),
         reply_markup=kb)
 
 # ── Home: control test ────────────────────────────────────────────────────────
@@ -815,6 +830,7 @@ def _finish_ctrl(uid, chat_id, msg_id):
     sc = int(storage.get_progress(uid, "ctrl_score", "0"))
     ctrl_total = len(MODULES[mid]["levels"][lvl]["control_test"])
     passed = sc >= CTRL_THRESHOLD
+    already_passed = storage.is_level_ctrl_passed(uid, mid, lvl)
     storage.set_progress(uid, "mode", "idle")
     storage.record_control_test(uid, mid, lvl, sc, passed)
     m = MODULES[mid]
@@ -827,7 +843,9 @@ def _finish_ctrl(uid, chat_id, msg_id):
     )
     if passed:
         storage.mark_level_ctrl_passed(uid, mid, lvl)
-        storage.add_xp(uid, XP_CTRL)
+        xp_awarded = XP_CTRL if not already_passed else 0
+        if xp_awarded:
+            storage.add_xp(uid, xp_awarded)
         nxt = lvl + 1
         if nxt <= 3:
             storage.set_module_level_unlocked(uid, mid, nxt)
@@ -838,7 +856,7 @@ def _finish_ctrl(uid, chat_id, msg_id):
         if att == 1: maybe_unlock(uid, "ctrl_first_pass")
         update_meta(uid)
         res = (f"🎉 <b>Контрольная сдана!</b>\n\nРезультат: <b>{sc}/{ctrl_total}</b>\n"
-               f"⭐ <b>+{XP_CTRL} XP</b>\n\n"
+               + (f"⭐ <b>+{xp_awarded} XP</b>\n\n" if xp_awarded else "⭐ XP не начислен: контрольная уже была сдана.\n\n")
                + (f"🔓 Уровень {nxt} открыт!" if nxt <= 3 else f"🏆 Модуль '{m['title']}' полностью пройден!")
                + review)
     else:

@@ -3,6 +3,7 @@ import unittest
 
 from quiz_utils import (
     add_quiz_result,
+    build_quiz_attempt,
     build_answer_review,
     normalize_mcq,
     normalize_package,
@@ -74,6 +75,30 @@ class QuizUtilsTest(unittest.TestCase):
         self.assertIn("Правильно", review)
         self.assertIn("Правильные ответы", review)
         self.assertIn("&lt;", review)
+
+    def test_shuffled_attempt_preserves_correct_answers(self):
+        questions = [
+            {
+                "id": "q1",
+                "q": "Выберите деепричастие.",
+                "options": ["читать", "читая", "читатель", "чтение"],
+                "correct": 1,
+                "tag": "syntax",
+            },
+            {
+                "id": "q2",
+                "q": "Что сделав?",
+                "options": ["прочитать", "прочитал", "прочитав", "читал"],
+                "correct": 2,
+                "tag": "aspect",
+            },
+        ]
+
+        attempt = build_quiz_attempt(questions, "s2_09", "p", seed=7)
+        answers = {q["id"]: q["options"][q["correct"]] for q in attempt}
+
+        self.assertEqual(answers["q1"], "читая")
+        self.assertEqual(answers["q2"], "прочитав")
 
 
 if __name__ == "__main__":

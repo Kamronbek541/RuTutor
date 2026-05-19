@@ -4,7 +4,7 @@ import storage
 from class_content import CLASS_SCHEDULE
 from ai import evaluate_student_text
 from quiz_utils import add_quiz_result, build_answer_review, safe_correct_idx, safe_html
-from utils import format_tags, format_error_stats, label
+from utils import format_tags, format_error_stats, label, truncate_text
 
 HINT_XP_COST = 2
 
@@ -184,6 +184,7 @@ def register(bot):
         storage.set_progress(uid, "cls_task_idx", "0")
         storage.set_progress(uid, "cls_correct", "0")
         storage.set_progress(uid, "cls_results", "[]")
+        storage.set_progress(uid, "cls_award_xp", "0" if storage.is_class_lesson_done(uid, lesson["date"]) else "1")
         _send_class_task(bot, call.message.chat.id, call.message.message_id, uid, lesson)
 
     def _send_class_task(bot, chat_id, message_id, uid, lesson):
@@ -250,7 +251,8 @@ def register(bot):
         if is_correct:
             correct = int(storage.get_progress(uid, "cls_correct", "0")) + 1
             storage.set_progress(uid, "cls_correct", str(correct))
-            storage.add_xp(uid, 3)
+            if storage.get_progress(uid, "cls_award_xp", "1") == "1":
+                storage.add_xp(uid, 3)
         storage.set_progress(
             uid,
             "cls_results",
@@ -273,7 +275,8 @@ def register(bot):
         storage.mark_class_lesson_done(uid, lesson["date"])
         storage.set_class_lesson_score(uid, lesson["date"], correct)
         storage.set_progress(uid, "mode", "idle")
-        if passed:
+        award_xp = storage.get_progress(uid, "cls_award_xp", "1") == "1"
+        if passed and award_xp:
             storage.add_xp(uid, xp)
 
         pct = int(correct / total * 100)
@@ -301,7 +304,7 @@ def register(bot):
             f"🎉 <b>Урок завершён!</b>\n\n"
             f"Тема: {lesson['emoji']} {lesson['title']}\n"
             f"Правильных: <b>{correct}/{total}</b> ({pct}%) {grade}\n"
-            + (f"⭐ <b>+{xp} XP</b>\n" if passed else "")
+            + (f"⭐ <b>+{xp} XP</b>\n" if passed and award_xp else ("⭐ XP не начислен: урок уже был пройден.\n" if passed else ""))
             + review
             + f"\n📝 <b>Домашнее задание:</b>\n{lesson['homework_prompt']}\n\n"
             f"<i>Напиши ответ боту — ИИ проверит и даст обратную связь!</i>",
@@ -346,7 +349,6 @@ def register(bot):
     def on_homework_text(message):
         uid = message.from_user.id
         text = (message.text or "").strip()
-        safe_delete(message.chat.id, message.message_id)
         if not text:
             bot.send_message(message.chat.id, "Напиши текст домашнего задания одним сообщением или нажми /start.", reply_markup=kb_back_class())
             return
@@ -386,7 +388,7 @@ def register(bot):
         exps = result.get("explanations", [])
         if not isinstance(exps, list):
             exps = [str(exps)]
-        exp_text = "\n".join(f"• {x}" for x in exps[:3]) or "• Отличная работа!"
+        exp_text = "\n".join(f"• {safe_html(x)}" for x in exps[:3]) or "• Отличная работа!"
 
         from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
         kb = InlineKeyboardMarkup()
@@ -396,10 +398,11 @@ def register(bot):
         bot.send_message(
             message.chat.id,
             f"🤖 <b>Проверка ДЗ</b>\n\n"
-            f"💬 {result.get('praise', 'Хорошая работа!')}\n\n"
-            f"✍️ <b>Исправленный вариант:</b>\n{result.get('corrected_text', '—')}\n\n"
+            f"💬 {safe_html(result.get('praise', 'Хорошая работа!'))}\n\n"
+            f"🧾 <b>Текст ученика:</b>\n{truncate_text(safe_html(text), 900)}\n\n"
+            f"✍️ <b>Исправленный вариант:</b>\n{safe_html(result.get('corrected_text', '—'))}\n\n"
             f"📌 <b>Разбор ошибок:</b>\n{exp_text}\n\n"
-            f"🎯 <b>Совет:</b> {result.get('next_micro_task', '')}\n\n"
+            f"🎯 <b>Совет:</b> {safe_html(result.get('next_micro_task', ''))}\n\n"
             f"🏷 <b>Ошибки:</b> {format_tags(error_tags)}\n"
             f"⭐ <b>+{xp_hw} XP</b> за ДЗ!",
             reply_markup=kb
