@@ -894,3 +894,22 @@ def register_prewarm_command(bot):
                 bot.send_message(msg.chat.id, f"⚠️ {l.lesson_id}: не удалось — {e}")
 
         bot.send_message(msg.chat.id, f"✅ Готово. Успешно: {ok}, ошибок: {fail}.")
+
+    @bot.message_handler(commands=["dbstatus"])
+    def on_dbstatus(msg):
+        uid = msg.from_user.id
+        if not is_admin(uid):
+            bot.reply_to(msg, "⛔️ Доступ запрещён.")
+            return
+
+        status = storage.get_db_status()
+        bot.reply_to(
+            msg,
+            "<b>💾 База RuTutor</b>\n\n"
+            f"Путь: <code>{status['db_path']}</code>\n"
+            f"Пользователи: <b>{status['users']}</b>\n"
+            f"Сохранённые уроки: <b>{status['cached_lessons']}</b>\n"
+            f"Доп. темы: <b>{status['custom_topics']}</b>\n"
+            f"Строки прогресса КТП: <b>{status['ktp_progress_rows']}</b>",
+            parse_mode="HTML",
+        )

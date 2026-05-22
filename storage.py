@@ -7,10 +7,37 @@ import time
 import json
 import random
 import threading
+import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
-DB_PATH = "bot.db"
+DB_FILENAME = "bot.db"
+
+
+def _default_data_dir() -> Path:
+    """Stable data folder outside release zips, so updates keep XP/cache."""
+    explicit = os.getenv("RUTUTOR_DATA_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
+        if base:
+            return Path(base) / "RuTutor"
+
+    return Path.home() / ".rututor"
+
+
+def _resolve_db_path() -> Path:
+    explicit = (os.getenv("RUTUTOR_DB_PATH") or os.getenv("BOT_DB_PATH") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return _default_data_dir() / DB_FILENAME
+
+
+DB_PATH = str(_resolve_db_path())
+_db_file_ready = False
 
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no confusing 0/O/1/I
 
@@ -19,13 +46,122 @@ _lock = threading.Lock()
 _con: Optional[sqlite3.Connection] = None
 
 
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except Exception:
+        return str(a) == str(b)
+
+
+def _legacy_db_candidates(target: Path) -> List[Path]:
+    """Find old project-local bot.db files to migrate into the stable DB path."""
+    candidates: List[Path] = []
+    explicit = (os.getenv("RUTUTOR_LEGACY_DB_PATH") or os.getenv("BOT_LEGACY_DB_PATH") or "").strip()
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+
+    here = Path(__file__).resolve().parent
+    roots = [Path.cwd(), here, here.parent, Path.cwd().parent]
+    for root in roots:
+        candidates.append(root / DB_FILENAME)
+        try:
+            candidates.extend(root.glob(f"*/{DB_FILENAME}"))
+        except Exception:
+            pass
+
+    unique: List[Path] = []
+    seen = set()
+    for path in candidates:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen or _same_path(path, target):
+            continue
+        seen.add(key)
+        unique.append(path)
+
+    existing = [p for p in unique if p.exists() and p.is_file() and p.stat().st_size > 0]
+    existing.sort(key=lambda p: (p.stat().st_mtime, p.stat().st_size), reverse=True)
+    return existing
+
+
+def _is_rututor_db(path: Path) -> bool:
+    try:
+        con = sqlite3.connect(str(path))
+        cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('users', 'ktp_lesson_cache')")
+        ok = cur.fetchone() is not None
+        con.close()
+        return ok
+    except Exception:
+        return False
+
+
+def _backup_sqlite_db(src: Path, dst: Path) -> bool:
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src_con = sqlite3.connect(str(src))
+        dst_con = sqlite3.connect(str(dst))
+        src_con.backup(dst_con)
+        dst_con.close()
+        src_con.close()
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_db_file_ready() -> None:
+    """Create stable DB folder and migrate an old local bot.db once if found."""
+    global _db_file_ready
+    if _db_file_ready:
+        return
+
+    target = Path(DB_PATH).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists():
+        for candidate in _legacy_db_candidates(target):
+            if _is_rututor_db(candidate) and _backup_sqlite_db(candidate, target):
+                print(f"[storage] Migrated existing database: {candidate} -> {target}")
+                break
+
+    _db_file_ready = True
+
+
+def get_db_path() -> str:
+    """Return the actual SQLite path used by the bot."""
+    return str(Path(DB_PATH).expanduser())
+
+
+def get_db_status() -> Dict[str, Any]:
+    """Small admin health snapshot for persistence-sensitive data."""
+    con = _get_con()
+    cur = con.cursor()
+
+    def count(table: str) -> int:
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            return int(cur.fetchone()[0])
+        except Exception:
+            return 0
+
+    return {
+        "db_path": get_db_path(),
+        "users": count("users"),
+        "cached_lessons": count("ktp_lesson_cache"),
+        "custom_topics": count("custom_topics"),
+        "ktp_progress_rows": count("ktp_lesson_progress"),
+    }
+
+
 def _get_con() -> sqlite3.Connection:
     """Return the shared SQLite connection (thread-safe, WAL mode)."""
     global _con
     if _con is None:
         with _lock:
             if _con is None:
-                conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+                _ensure_db_file_ready()
+                conn = sqlite3.connect(get_db_path(), check_same_thread=False)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA busy_timeout=5000")
                 conn.execute("PRAGMA synchronous=NORMAL")
