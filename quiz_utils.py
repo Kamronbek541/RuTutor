@@ -96,6 +96,26 @@ def _known_repair(question: Dict[str, Any], options: List[str]) -> Optional[Dict
             "tag": question.get("tag") or "agreement",
         }
 
+    # Word-formation generated questions often confuse the answer word with the
+    # name of the method ("семейный" vs "суффиксальный"). Repair the common
+    # school examples locally so cached AI packages stop leaking bad keys.
+    if "от слова" in q_norm and "суффиксаль" in q_norm and ("образован" in q_norm or "образовано" in q_norm):
+        answer = ""
+        if "семья" in q_norm:
+            answer = "семейный"
+        elif "технолог" in q_norm:
+            answer = "технологичный"
+        elif "друг" in q_norm:
+            answer = "дружок"
+        if answer:
+            fixed_options, correct = _put_correct_option(options, answer)
+            return {
+                **question,
+                "options": fixed_options,
+                "correct": correct,
+                "tag": question.get("tag") or "word_formation",
+            }
+
     return None
 
 
@@ -272,10 +292,9 @@ def build_answer_review(
 
     if show_all_correct:
         lines.append("")
-        lines.append("<b>Правильные ответы:</b>")
+        lines.append("<b>Ключ ответов:</b>")
         for r in results[:max_all]:
-            icon = "✅" if r.get("ok") else "❌"
-            lines.append(f"{icon} {int(r.get('idx') or 0)}. <b>{safe_html(r.get('correct', '—'))}</b>")
+            lines.append(f"{int(r.get('idx') or 0)}. <b>{safe_html(r.get('correct', '—'))}</b>")
         if len(results) > max_all:
             lines.append(f"...и ещё {len(results) - max_all}.")
 

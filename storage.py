@@ -457,12 +457,14 @@ def get_control_test_attempts(user_id: int, module_id: str, level: int) -> int:
 def track_errors(user_id: int, tags: List[str]):
     if not tags:
         return
+    from utils import split_tags
+    clean_tags = [t for t in split_tags(tags) if t and t != "no_error"]
+    if not clean_tags:
+        return
     con = _get_con()
     with _lock:
         cur = con.cursor()
-        for tag in tags:
-            if not tag or tag == "no_error":
-                continue
+        for tag in clean_tags:
             cur.execute("""
                 INSERT INTO error_tracker(user_id, tag, count) VALUES (?,?,1)
                 ON CONFLICT(user_id, tag) DO UPDATE SET count = count + 1

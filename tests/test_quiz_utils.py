@@ -55,6 +55,16 @@ class QuizUtilsTest(unittest.TestCase):
         self.assertEqual(q["options"][q["correct"]], "тише")
         self.assertEqual(len(q["options"]), 4)
 
+    def test_repairs_word_formation_key_confusion(self):
+        q = normalize_mcq({
+            "q": "От слова «семья» образовано суффиксальным способом:",
+            "options": ["переучитель", "технологичный", "семья", "суффиксальный"],
+            "correct": 3,
+            "tag": "word_formation",
+        })
+
+        self.assertEqual(q["options"][q["correct"]], "семейный")
+
     def test_review_lists_wrong_and_all_correct_answers(self):
         tasks = normalize_package({
             "practice": [
@@ -73,7 +83,7 @@ class QuizUtilsTest(unittest.TestCase):
         self.assertFalse(results[0]["ok"])
         review = build_answer_review(tasks, results_json)
         self.assertIn("Правильно", review)
-        self.assertIn("Правильные ответы", review)
+        self.assertIn("Ключ ответов", review)
         self.assertIn("&lt;", review)
 
     def test_shuffled_attempt_preserves_correct_answers(self):
