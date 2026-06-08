@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional, List
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from quiz_utils import normalize_package
+from quiz_utils import normalize_package, safe_correct_idx
 from utils import split_tags
 
 load_dotenv()
@@ -551,7 +551,10 @@ def generate_ktp_package_via_ai(
         "Не создавай двусмысленные вопросы, где грамматически подходят два варианта. "
         "Перед ответом внутренне проверь каждый вопрос: ровно 4 уникальных варианта, ровно 1 правильный, "
         "правильный вариант отвечает именно на вопрос, а не является названием темы/способа. "
-        "Если вопрос просит выбрать слово, в correct должно быть слово; если просит способ, в correct должен быть способ."
+        "Если вопрос просит выбрать слово, в correct должно быть слово; если просит способ, в correct должен быть способ.\n\n"
+        "ВЕСЬ русский текст (теория, вопросы, варианты ответов, словарь, письменное задание) должен быть написан "
+        "БЕЗ орфографических, грамматических, пунктуационных и лексических ошибок, естественным литературным русским языком. "
+        "Проверяй окончания, согласование, падежи, написание Н/НН и НЕ. Не используй кальки и неестественные обороты."
     )
 
     user = (
@@ -594,7 +597,7 @@ def generate_ktp_package_via_ai(
     for i, q in enumerate(data["exam"]):
         q.setdefault("id", f"{lesson_id}_e{i+1}")
 
-    return normalize_package(data, lesson_id)
+    return proofread_package(normalize_package(data, lesson_id), lesson_id, title=lesson_title)
 
 
 def parse_exercises_from_document(
@@ -639,7 +642,10 @@ def parse_exercises_from_document(
         "\"recommended_repeat\": [{\"title\": \"тема\", \"action\": \"что повторить\"}, ...]}\n\n"
         "Теги (tag) выбирай из: [agreement, gender, spelling, vocab, case, conjugation, declension, "
         "aspect, participle, punctuation, syntax, literature, word_order, short_adj, numeral, imperative].\n"
-        "Теория должна быть короткой (до 800 символов) и использовать HTML-теги для форматирования."
+        "Теория должна быть короткой (до 800 символов) и использовать HTML-теги для форматирования.\n\n"
+        "ВЕСЬ русский текст (теория, вопросы, варианты ответов, словарь, письменное задание) должен быть написан "
+        "БЕЗ орфографических, грамматических, пунктуационных и лексических ошибок, естественным литературным русским языком. "
+        "Проверяй окончания, согласование, падежи, написание Н/НН и НЕ. Не используй кальки и неестественные обороты."
     )
 
     user = (
@@ -679,4 +685,191 @@ def parse_exercises_from_document(
         q.setdefault("id", f"custom_e{i+1}")
         q.setdefault("tag", "vocab")
 
-    return normalize_package(data, "custom")
+    return proofread_package(normalize_package(data, "custom"), "custom", title=topic_name)
+
+
+# ── Proofreading: language editor pass over a whole lesson package ────────────
+_PROOFREAD_SYSTEM = (
+    "Ты — профессиональный редактор-корректор русского языка. "
+    "Тебе дают JSON-объект учебного урока для узбекоговорящих учеников. "
+    "Твоя ЕДИНСТВЕННАЯ задача — исправить ЯЗЫК: орфографию, грамматику, пунктуацию, "
+    "лексику, неправильные формы и окончания слов так, чтобы весь русский текст "
+    "читался как грамотный, естественный литературный русский язык.\n\n"
+    "СТРОГИЕ ЗАПРЕТЫ (нарушать нельзя):\n"
+    "1. НЕ меняй смысл и сложность ни одного вопроса.\n"
+    "2. НЕ меняй, какой вариант является правильным. Поле \"correct\" должно остаться ТЕМ ЖЕ числом.\n"
+    "3. НЕ меняй порядок вариантов и НЕ меняй их количество. Если было 4 варианта — "
+    "должно остаться 4 варианта в том же порядке. Исправляй только текст ВНУТРИ каждого "
+    "варианта на той же позиции.\n"
+    "4. НЕ добавляй, не удаляй и не объединяй варианты.\n"
+    "5. НЕ меняй поля \"id\" и \"tag\" — копируй их без изменений.\n"
+    "6. НЕ переводи и НЕ меняй узбекскую часть словаря (второй элемент пары в vocab) — "
+    "трогай только русское слово (первый элемент).\n"
+    "7. Сохраняй HTML-теги (<b>, <i>) в теории и заданиях.\n"
+    "8. Если в тексте нет ошибок — верни его без изменений.\n\n"
+    "Что нужно править: окончания (написаный → написанный), согласование "
+    "(написанное работа → написанная работа), падежи, написание Н/НН и НЕ, опечатки, "
+    "пунктуацию, неестественные обороты и кальки.\n\n"
+    "Верни СТРОГО тот же JSON с теми же ключами и той же структурой, "
+    "только с исправленным русским текстом."
+)
+
+
+def _is_nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _reordered(orig_options: List[str], new_options: List[str], orig_idx: int) -> bool:
+    """Tripwire: did the model move the correct answer off its locked position?
+
+    We can't compare exact text (it may have been corrected), but a fuzzy check on
+    the correct option's leading characters catches gross reordering.
+    """
+    if not (0 <= orig_idx < len(orig_options)) or not (0 <= orig_idx < len(new_options)):
+        return True
+    old_correct = str(orig_options[orig_idx]).strip().casefold().replace("ё", "е")
+    new_at_pos = str(new_options[orig_idx]).strip().casefold().replace("ё", "е")
+    if not old_correct or not new_at_pos:
+        return False
+    # If the corrected option at the locked position shares no common prefix with the
+    # original correct answer, the model likely reordered the list.
+    prefix = min(len(old_correct), len(new_at_pos), 4)
+    return old_correct[:prefix] != new_at_pos[:prefix]
+
+
+def _merge_proofread_question(orig: Dict[str, Any], edited: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Take corrected wording from `edited` but keep the original answer linkage."""
+    orig_options = [str(o) for o in (orig.get("options") or [])]
+    orig_idx = safe_correct_idx(orig)
+    if not isinstance(edited, dict):
+        return orig
+    new_options = edited.get("options")
+    if not isinstance(new_options, list) or len(new_options) != len(orig_options):
+        return orig  # count changed → reject edit, keep original
+    new_options = [str(o) for o in new_options]
+    if _reordered(orig_options, new_options, orig_idx):
+        return orig  # reordered → reject edit, keep original
+    merged = dict(orig)
+    merged["options"] = new_options
+    if _is_nonempty_str(edited.get("q")):
+        merged["q"] = edited["q"]
+    # Force-preserve the answer linkage and structural keys.
+    merged["correct"] = orig_idx
+    merged["id"] = orig.get("id")
+    merged["tag"] = orig.get("tag")
+    return merged
+
+
+def _merge_proofread_quiz(orig_list: Any, edited_list: Any) -> List[Dict[str, Any]]:
+    orig_items = [q for q in (orig_list or []) if isinstance(q, dict)]
+    edited_by_id: Dict[str, Dict[str, Any]] = {}
+    if isinstance(edited_list, list):
+        for q in edited_list:
+            if isinstance(q, dict) and q.get("id") is not None:
+                edited_by_id[str(q.get("id"))] = q
+    out: List[Dict[str, Any]] = []
+    for q in orig_items:
+        out.append(_merge_proofread_question(q, edited_by_id.get(str(q.get("id")))))
+    return out
+
+
+def proofread_package(
+    package: Dict[str, Any],
+    lesson_id: str,
+    *,
+    title: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a language-editor pass over a lesson package.
+
+    Fixes orthography/grammar/lexical/punctuation errors in all Russian text while
+    preserving structure: the count/order of options, the correct-answer index,
+    ids/tags, and the Uzbek side of the vocabulary. Best-effort: on any failure
+    (OpenAI not configured, API error, malformed JSON) the original package is
+    returned unchanged so content is never lost.
+    """
+    if not isinstance(package, dict) or not package:
+        return package
+    if not OPENAI_API_KEY or not OPENAI_MODEL or _client is None:
+        return package
+
+    try:
+        # Build a slim payload with just the editable text + structural anchors.
+        payload = {
+            "lesson_id": lesson_id,
+            "title": title or "",
+            "theory": package.get("theory", ""),
+            "vocab": package.get("vocab", []),
+            "practice": [
+                {"id": q.get("id"), "q": q.get("q", ""), "options": q.get("options", []),
+                 "correct": safe_correct_idx(q), "tag": q.get("tag")}
+                for q in (package.get("practice") or []) if isinstance(q, dict)
+            ],
+            "exam": [
+                {"id": q.get("id"), "q": q.get("q", ""), "options": q.get("options", []),
+                 "correct": safe_correct_idx(q), "tag": q.get("tag")}
+                for q in (package.get("exam") or []) if isinstance(q, dict)
+            ],
+            "writing_prompt": package.get("writing_prompt", ""),
+            "recommended_repeat": package.get("recommended_repeat", []),
+        }
+        user = (
+            "Отредактируй русский язык в этом уроке. Сохрани структуру, порядок "
+            "вариантов и индексы правильных ответов:\n\n"
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        resp = _client.responses.create(
+            model=OPENAI_MODEL,
+            input=[
+                {"role": "system", "content": _PROOFREAD_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+        )
+        edited = _safe_json(getattr(resp, "output_text", ""))
+        if not isinstance(edited, dict):
+            return package
+    except Exception:
+        return package
+
+    # Reassemble: take corrected wording, keep original structure/linkage.
+    result = dict(package)
+
+    if _is_nonempty_str(edited.get("theory")):
+        result["theory"] = edited["theory"]
+    if _is_nonempty_str(edited.get("writing_prompt")):
+        result["writing_prompt"] = edited["writing_prompt"]
+
+    # Vocab: fix only the Russian side, keep Uzbek and length.
+    orig_vocab = package.get("vocab") or []
+    new_vocab = edited.get("vocab")
+    if isinstance(new_vocab, list) and len(new_vocab) == len(orig_vocab):
+        merged_vocab = []
+        for orig_row, new_row in zip(orig_vocab, new_vocab):
+            if (isinstance(orig_row, (list, tuple)) and len(orig_row) >= 2
+                    and isinstance(new_row, (list, tuple)) and len(new_row) >= 1
+                    and _is_nonempty_str(new_row[0])):
+                merged_vocab.append([new_row[0], orig_row[1]])
+            else:
+                merged_vocab.append(list(orig_row) if isinstance(orig_row, (list, tuple)) else orig_row)
+        result["vocab"] = merged_vocab
+
+    result["practice"] = _merge_proofread_quiz(package.get("practice"), edited.get("practice"))
+    result["exam"] = _merge_proofread_quiz(package.get("exam"), edited.get("exam"))
+
+    # recommended_repeat: take corrected text by position, keep length.
+    orig_rec = package.get("recommended_repeat") or []
+    new_rec = edited.get("recommended_repeat")
+    if isinstance(new_rec, list) and len(new_rec) == len(orig_rec):
+        merged_rec = []
+        for orig_item, new_item in zip(orig_rec, new_rec):
+            if isinstance(orig_item, dict) and isinstance(new_item, dict):
+                m = dict(orig_item)
+                if _is_nonempty_str(new_item.get("title")):
+                    m["title"] = new_item["title"]
+                if _is_nonempty_str(new_item.get("action")):
+                    m["action"] = new_item["action"]
+                merged_rec.append(m)
+            else:
+                merged_rec.append(orig_item)
+        result["recommended_repeat"] = merged_rec
+
+    return normalize_package(result, lesson_id)

@@ -855,7 +855,7 @@ def register_join_commands(bot):
 # ── Admin: pre-generate KTP lesson cache ─────────────────────────────────────
 def register_prewarm_command(bot):
     """Admin-only: /prewarm [N] — pre-generate and cache KTP lesson packages."""
-    from ai import predefined_ktp_package, generate_ktp_package_via_ai
+    from ai import predefined_ktp_package, generate_ktp_package_via_ai, proofread_package
 
     @bot.message_handler(commands=["prewarm"])
     def on_prewarm(msg):
@@ -894,6 +894,81 @@ def register_prewarm_command(bot):
                 bot.send_message(msg.chat.id, f"⚠️ {l.lesson_id}: не удалось — {e}")
 
         bot.send_message(msg.chat.id, f"✅ Готово. Успешно: {ok}, ошибок: {fail}.")
+
+    @bot.message_handler(commands=["rebuild"])
+    def on_rebuild(msg):
+        """Admin-only: /rebuild [семестр] — заново сгенерировать и вычитать уроки КТП.
+
+        В отличие от /prewarm, эта команда НАМЕРЕННО перезаписывает уже закэшированные
+        уроки: старый сгенерированный текст с ошибками выбрасывается и заменяется свежим,
+        прошедшим языковую вычитку (proofread_package). Ручные (predefined) уроки не трогаются —
+        их правят в исходниках. Кастомные темы (из загруженных документов) перегенерировать
+        нельзя без исходного документа, поэтому они вычитываются «как есть».
+        """
+        uid = msg.from_user.id
+        if not is_admin(uid):
+            bot.reply_to(msg, "⛔️ Доступ запрещён.")
+            return
+
+        args = (msg.text or "").split()
+        sem = None
+        if len(args) >= 2:
+            try:
+                sem = int(args[1])
+            except Exception:
+                sem = None
+
+        lesson_list = [l for l in KTP_LESSONS if (sem is None or l.semester == sem)]
+        scope = f"семестр {sem}" if sem else "все семестры"
+        bot.send_message(
+            msg.chat.id,
+            f"🔄 Перегенерация + вычитка ({scope}): {len(lesson_list)} уроков КТП.\n"
+            f"Это может занять время…",
+        )
+
+        regenerated = 0
+        manual = 0
+        proofed = 0
+        fail = 0
+        for i, l in enumerate(lesson_list, 1):
+            try:
+                # Ручные уроки остаются из кода — их вычитываем в исходниках, не перезаписываем кэш.
+                if predefined_ktp_package(l.lesson_id):
+                    manual += 1
+                    continue
+                # Перегенерация заново (внутри уже идёт усиленный промпт + вычитка).
+                pack = generate_ktp_package_via_ai(l.lesson_id, l.title, l.lt, l.kind)
+                storage.set_ktp_cache(l.lesson_id, pack)
+                regenerated += 1
+                if i % 3 == 0:
+                    bot.send_message(msg.chat.id, f"…готово {i}/{len(lesson_list)}")
+            except Exception as e:
+                fail += 1
+                bot.send_message(msg.chat.id, f"⚠️ {l.lesson_id}: не удалось — {e}")
+
+        # Кастомные темы (загруженные документы): перегенерировать нельзя, вычитываем кэш.
+        if sem is None:
+            try:
+                for t in storage.list_custom_topics():
+                    lesson_id = t.get("lesson_id")
+                    cached = storage.get_ktp_cache(lesson_id) if lesson_id else None
+                    if not cached:
+                        continue
+                    try:
+                        fixed = proofread_package(cached, lesson_id, title=t.get("name"))
+                        storage.set_ktp_cache(lesson_id, fixed)
+                        proofed += 1
+                    except Exception as e:
+                        fail += 1
+                        bot.send_message(msg.chat.id, f"⚠️ {lesson_id}: не удалось — {e}")
+            except Exception:
+                pass
+
+        bot.send_message(
+            msg.chat.id,
+            f"✅ Готово. Перегенерировано: {regenerated}, "
+            f"ручных (пропущено): {manual}, кастомных вычитано: {proofed}, ошибок: {fail}.",
+        )
 
     @bot.message_handler(commands=["dbstatus"])
     def on_dbstatus(msg):
