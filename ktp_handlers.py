@@ -16,9 +16,11 @@ from quiz_utils import (
     safe_html,
 )
 from utils import truncate_text
+from question_reports import report_question
+import xp_rules
 
 
-PASS_EXAM_THRESHOLD = 4  # legacy fallback; real threshold is dynamic
+PASS_EXAM_THRESHOLD = xp_rules.KTP_PASS_MIN  # legacy fallback; real threshold is dynamic
 
 
 # Basic hints by tag
@@ -43,18 +45,15 @@ HINTS.update({
 
 DEFAULT_HINT = "💡 Прочитай теорию ещё раз и подумай, какая форма слова нужна."
 
-HINT_COST = 2  # XP cost per hint
+AI_OFF_TEXT = "🔒 Учитель отключил ИИ-помощника для вашего класса."
+HINTS_OFF_TEXT = "🔒 Учитель отключил подсказки для вашего класса."
+
+HINT_COST = xp_rules.HINT_COST  # XP cost per hint
 
 
 def exam_pass_threshold(total: int) -> int:
     """Pass mark: about 60%. Works for old 6-question cache and new 8-question exams."""
-    try:
-        total = int(total)
-    except Exception:
-        total = 0
-    if total <= 0:
-        return PASS_EXAM_THRESHOLD
-    return max(1, (total * 3 + 4) // 5)
+    return xp_rules.exam_pass_threshold(total)
 
 
 def _safe_correct_idx(question: Dict[str, Any]) -> int:
@@ -193,6 +192,7 @@ def register(bot):
                 done = sum(1 for l in lessons if storage.get_ktp_progress(uid, l.lesson_id).get("done"))
                 kb.add(InlineKeyboardButton(f"📄 Семестр {sem} ({done}/{len(lessons)})", callback_data=f"ktp:sem:{sem}"))
         kb.add(InlineKeyboardButton("📈 Мой прогресс", callback_data="ktp:progress"))
+        kb.add(InlineKeyboardButton("🎁 XP по урокам", callback_data="ktp:xp"))
         kb.add(InlineKeyboardButton("📊 Мои ошибки", callback_data="home:errors"))
         kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
         return kb
@@ -211,8 +211,11 @@ def register(bot):
         kb = InlineKeyboardMarkup(row_width=2)
         kb.add(InlineKeyboardButton("🃏 Словарик", callback_data=f"ktp:vocab:{lesson_id}"),
                InlineKeyboardButton("🧩 Практика", callback_data=f"ktp:practice_start:{lesson_id}"))
-        kb.add(InlineKeyboardButton("📝 Мини‑контрольная", callback_data=f"ktp:exam_start:{lesson_id}"),
-               InlineKeyboardButton("✍️ Письмо (ИИ)", callback_data=f"ktp:write_start:{lesson_id}"))
+        if storage.is_ai_enabled_for(uid):
+            kb.add(InlineKeyboardButton("📝 Мини‑контрольная", callback_data=f"ktp:exam_start:{lesson_id}"),
+                   InlineKeyboardButton("✍️ Письмо (ИИ)", callback_data=f"ktp:write_start:{lesson_id}"))
+        else:
+            kb.add(InlineKeyboardButton("📝 Мини‑контрольная", callback_data=f"ktp:exam_start:{lesson_id}"))
         kb.add(InlineKeyboardButton("🔁 Повторить", callback_data=f"ktp:lesson:{lesson_id}"),
                InlineKeyboardButton("⬅️ Назад", callback_data="menu:ktp"))
         return kb
@@ -290,6 +293,7 @@ def register(bot):
                 )
 
         kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🎁 XP по урокам", callback_data="ktp:xp"))
         kb.add(InlineKeyboardButton("📘 К семестрам", callback_data="menu:ktp"))
         kb.add(InlineKeyboardButton("📊 Мои ошибки", callback_data="home:errors"))
         kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
@@ -401,7 +405,11 @@ def register(bot):
         kb = InlineKeyboardMarkup(row_width=1)
         for i, opt in enumerate(t.get("options", [])):
             kb.add(InlineKeyboardButton(opt, callback_data=f"ktp:{kind}ans:{lesson_id}:{idx}:{i}"))
-        kb.add(InlineKeyboardButton("💡 Подсказка (−2 XP)", callback_data=f"ktp:hint:{lesson_id}:{idx}:{kind}"))
+        if storage.are_hints_enabled_for(uid):
+            kb.add(InlineKeyboardButton(f"💡 Подсказка (−{HINT_COST} XP)",
+                                        callback_data=f"ktp:hint:{lesson_id}:{idx}:{kind}"))
+        kb.add(InlineKeyboardButton("⚠️ Ошибка в вопросе",
+                                    callback_data=f"ktp:report:{lesson_id}:{idx}:{kind}"))
         kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
         title = "Практика" if kind == "p" else "Мини‑контрольная"
         bot.edit_message_text(
@@ -412,6 +420,9 @@ def register(bot):
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:hint:"))
     def on_hint(call):
         uid = call.from_user.id
+        if not storage.are_hints_enabled_for(uid):
+            bot.answer_callback_query(call.id, HINTS_OFF_TEXT, show_alert=True)
+            return
         # Check XP balance before deducting
         current_xp = storage.get_user_xp(uid)
         if current_xp < HINT_COST:
@@ -425,9 +436,20 @@ def register(bot):
             return
         tag = (tasks[idx].get("tag") or "")
         hint = HINTS.get(tag, DEFAULT_HINT)
-        storage.add_xp(uid, -HINT_COST)
+        storage.award_xp(uid, -HINT_COST, xp_rules.SRC_HINT, lesson_key=lesson_id)
         storage.increment_hint_used(uid)
         bot.answer_callback_query(call.id, hint, show_alert=True)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:report:"))
+    def on_report_question(call):
+        uid = call.from_user.id
+        _, _, lesson_id, idx_s, kind = call.data.split(":")
+        idx = int(idx_s)
+        tasks = _load_attempt_tasks(uid, lesson_id, kind)
+        if idx >= len(tasks):
+            bot.answer_callback_query(call.id)
+            return
+        report_question(bot, uid, lesson_id, tasks[idx], call)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:pans:") or c.data.startswith("ktp:eans:"))
     def on_answer(call):
@@ -477,8 +499,7 @@ def register(bot):
         prev_best_key = "practice_best" if kind == "p" else "exam_best"
         prev_best = int(prev.get(prev_best_key) or 0)
         was_passed = kind == "e" and prev_best >= pass_mark
-        improvement = max(0, correct - prev_best)
-        xp_awarded = improvement * (2 if kind == "p" else 3)
+        xp_awarded = xp_rules.ktp_mcq_xp(kind, prev_best, correct)
 
         if kind == "p":
             storage.upsert_ktp_progress(uid, lesson_id, practice_score=correct)
@@ -489,16 +510,24 @@ def register(bot):
         grade = "🌟 Отлично!" if pct >= 90 else ("👍 Хорошо!" if pct >= 70 else ("😊 Неплохо!" if pct >= 50 else "💪 Повтори тему!"))
 
         passed = (kind == "e" and correct >= pass_mark)
-        if passed and not was_passed:
-            xp_awarded += 25
         if xp_awarded:
-            storage.add_xp(uid, xp_awarded)
+            storage.award_xp(
+                uid, xp_awarded,
+                xp_rules.SRC_KTP_PRACTICE if kind == "p" else xp_rules.SRC_KTP_EXAM,
+                lesson_key=lesson_id,
+            )
+        # Бонус за первую сдачу пишем отдельной строкой журнала, чтобы отчёт
+        # совпадал с текстом правил; ученику показываем общую сумму.
+        if passed and not was_passed:
+            bonus = xp_rules.ktp_exam_first_pass_xp()
+            storage.award_xp(uid, bonus, xp_rules.SRC_KTP_EXAM_PASS, lesson_key=lesson_id)
+            xp_awarded += bonus
 
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("⬅️ К уроку", callback_data=f"ktp:lesson:{lesson_id}"))
         if kind == "p":
             kb.add(InlineKeyboardButton("📝 К контрольной", callback_data=f"ktp:exam_start:{lesson_id}"))
-        else:
+        elif storage.is_ai_enabled_for(uid):
             kb.add(InlineKeyboardButton("✍️ Письмо (ИИ)", callback_data=f"ktp:write_start:{lesson_id}"))
 
         title = "Практика завершена" if kind == "p" else "Контрольная завершена"
@@ -532,8 +561,11 @@ def register(bot):
     # ── Writing flow ──────────────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:write_start:"))
     def on_write_start(call):
-        bot.answer_callback_query(call.id)
         uid = call.from_user.id
+        if not storage.is_ai_enabled_for(uid):
+            bot.answer_callback_query(call.id, AI_OFF_TEXT, show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
         lesson_id = call.data.split(":")[2]
         meta = LESSON_BY_ID.get(lesson_id)
         if not meta:
@@ -543,8 +575,11 @@ def register(bot):
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("ktp:write_back:"))
     def on_write_back(call):
-        bot.answer_callback_query(call.id)
         uid = call.from_user.id
+        if not storage.is_ai_enabled_for(uid):
+            bot.answer_callback_query(call.id, AI_OFF_TEXT, show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
         lesson_id = call.data.split(":")[2]
         if lesson_id not in LESSON_BY_ID:
             return
@@ -563,6 +598,11 @@ def register(bot):
     @bot.message_handler(func=lambda m: storage.get_progress(m.from_user.id, "mode", "") == "awaiting_ktp_text" and not is_command_text(m.text or ""))
     def on_write_text(msg):
         uid = msg.from_user.id
+        if not storage.is_ai_enabled_for(uid):
+            storage.set_progress(uid, "mode", "idle")
+            storage.clear_progress_prefix(uid, "ktp_write_")
+            bot.send_message(msg.chat.id, AI_OFF_TEXT, reply_markup=kb_back_menu())
+            return
         text = (msg.text or "").strip()
         lesson_id = storage.get_progress(uid, "ktp_write_lesson", "")
         meta = LESSON_BY_ID.get(lesson_id)
@@ -617,14 +657,14 @@ def register(bot):
 
         # XP is awarded for the first writing attempt or for improving the best score.
         scores = result.get("scores") or {}
-        if first_writing:
-            xp = 10 + int(scores.get("overall", overall)) * 3 + int(scores.get("coherence", 1))
-        elif overall > prev_writing_best:
-            xp = (overall - prev_writing_best) * 5
-        else:
-            xp = 0
+        xp = xp_rules.ktp_writing_xp(
+            first_writing,
+            int(scores.get("overall", overall)),
+            int(scores.get("coherence", 1)),
+            prev_writing_best,
+        )
         if xp:
-            storage.add_xp(uid, xp)
+            storage.award_xp(uid, xp, xp_rules.SRC_KTP_WRITING, lesson_key=lesson_id)
 
         # mark done if exam passed
         p = storage.get_ktp_progress(uid, lesson_id)

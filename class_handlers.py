@@ -4,9 +4,14 @@ import storage
 from class_content import CLASS_SCHEDULE
 from ai import evaluate_student_text
 from quiz_utils import add_quiz_result, build_answer_review, safe_correct_idx, safe_html
+from question_reports import report_question
 from utils import format_tags, format_error_stats, label, truncate_text
+import xp_rules
 
-HINT_XP_COST = 2
+HINT_XP_COST = xp_rules.HINT_COST
+
+AI_OFF_TEXT = "🔒 Учитель отключил ИИ-помощника для вашего класса."
+HINTS_OFF_TEXT = "🔒 Учитель отключил подсказки для вашего класса."
 
 # Hints per task tag
 HINTS = {
@@ -199,7 +204,9 @@ def register(bot):
         kb = InlineKeyboardMarkup(row_width=1)
         for i, opt in enumerate(task["options"]):
             kb.add(InlineKeyboardButton(opt, callback_data=f"clsans:{idx}:{i}"))
-        kb.add(InlineKeyboardButton(f"💡 Подсказка (−{HINT_XP_COST} XP)", callback_data=f"class:hint:{lesson['id']}:{idx}"))
+        if storage.are_hints_enabled_for(uid):
+            kb.add(InlineKeyboardButton(f"💡 Подсказка (−{HINT_XP_COST} XP)", callback_data=f"class:hint:{lesson['id']}:{idx}"))
+        kb.add(InlineKeyboardButton("⚠️ Ошибка в вопросе", callback_data=f"class:report:{lesson['id']}:{idx}"))
         kb.add(InlineKeyboardButton("📅 Расписание", callback_data="class:schedule"))
         bot.edit_message_text(
             f"📖 <b>Урок: {lesson['title']}</b>\n"
@@ -210,6 +217,9 @@ def register(bot):
     @bot.callback_query_handler(func=lambda c: c.data.startswith("class:hint:"))
     def on_class_hint(call):
         uid = call.from_user.id
+        if not storage.are_hints_enabled_for(uid):
+            bot.answer_callback_query(call.id, HINTS_OFF_TEXT, show_alert=True)
+            return
         # Check XP balance before deducting
         current_xp = storage.get_user_xp(uid)
         if current_xp < HINT_XP_COST:
@@ -224,9 +234,21 @@ def register(bot):
         task = lesson["tasks"][idx]
         tag = task.get("tag", "")
         hint_text = HINTS.get(tag, DEFAULT_HINT)
-        storage.add_xp(uid, -HINT_XP_COST)
+        storage.award_xp(uid, -HINT_XP_COST, xp_rules.SRC_HINT,
+                         lesson_key=f"class:{lesson['date']}")
         storage.increment_hint_used(uid)
         bot.answer_callback_query(call.id, hint_text, show_alert=True)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("class:report:"))
+    def on_class_report(call):
+        uid = call.from_user.id
+        parts = call.data.split(":")
+        lesson_id, idx = parts[2], int(parts[3])
+        lesson = next((l for l in CLASS_SCHEDULE if l["id"] == lesson_id), None)
+        if not lesson or idx >= len(lesson["tasks"]):
+            bot.answer_callback_query(call.id)
+            return
+        report_question(bot, uid, f"class:{lesson['date']}", lesson["tasks"][idx], call)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("clsans:"))
     def on_class_answer(call):
@@ -252,7 +274,8 @@ def register(bot):
             correct = int(storage.get_progress(uid, "cls_correct", "0")) + 1
             storage.set_progress(uid, "cls_correct", str(correct))
             if storage.get_progress(uid, "cls_award_xp", "1") == "1":
-                storage.add_xp(uid, 3)
+                storage.award_xp(uid, xp_rules.class_correct_xp(), xp_rules.SRC_CLASS_CORRECT,
+                                 lesson_key=f"class:{lesson['date']}")
         storage.set_progress(
             uid,
             "cls_results",
@@ -269,7 +292,7 @@ def register(bot):
         from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
         correct = int(storage.get_progress(uid, "cls_correct", "0"))
         total = len(lesson["tasks"])
-        xp = lesson.get("xp", 20)
+        xp = xp_rules.class_lesson_xp(lesson.get("xp"))
         passed = correct >= total // 2
 
         storage.mark_class_lesson_done(uid, lesson["date"])
@@ -277,7 +300,8 @@ def register(bot):
         storage.set_progress(uid, "mode", "idle")
         award_xp = storage.get_progress(uid, "cls_award_xp", "1") == "1"
         if passed and award_xp:
-            storage.add_xp(uid, xp)
+            storage.award_xp(uid, xp, xp_rules.SRC_CLASS_LESSON,
+                             lesson_key=f"class:{lesson['date']}")
 
         pct = int(correct / total * 100)
         if pct >= 90:
@@ -296,7 +320,8 @@ def register(bot):
         )
 
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("📝 Сдать домашнее задание", callback_data=f"class:hw:{lesson['id']}"))
+        if storage.is_ai_enabled_for(uid):
+            kb.add(InlineKeyboardButton("📝 Сдать домашнее задание", callback_data=f"class:hw:{lesson['id']}"))
         kb.add(InlineKeyboardButton("📅 Расписание", callback_data="class:schedule"))
         kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
 
@@ -314,8 +339,11 @@ def register(bot):
     # ── Homework flow ──────────────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data.startswith("class:hw:"))
     def on_class_hw_start(call):
-        bot.answer_callback_query(call.id)
         uid = call.from_user.id
+        if not storage.is_ai_enabled_for(uid):
+            bot.answer_callback_query(call.id, AI_OFF_TEXT, show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
         lesson_id = call.data.split(":", 2)[2]
         lesson = next((l for l in CLASS_SCHEDULE if l["id"] == lesson_id), None)
         if not lesson:
@@ -348,6 +376,11 @@ def register(bot):
     @bot.message_handler(func=lambda m: storage.get_progress(m.from_user.id, "mode", "") == "awaiting_hw" and not is_command_text(m.text or ""))
     def on_homework_text(message):
         uid = message.from_user.id
+        if not storage.is_ai_enabled_for(uid):
+            storage.set_progress(uid, "mode", "idle")
+            storage.clear_progress_prefix(uid, "hw_")
+            bot.send_message(message.chat.id, AI_OFF_TEXT, reply_markup=kb_back_class())
+            return
         text = (message.text or "").strip()
         if not text:
             bot.send_message(message.chat.id, "Напиши текст домашнего задания одним сообщением или нажми /start.", reply_markup=kb_back_class())
@@ -382,8 +415,9 @@ def register(bot):
         storage.track_errors(uid, error_tags)
 
         ai_score = result.get("score", 1)
-        xp_hw = 15 + ai_score * 2
-        storage.add_xp(uid, xp_hw)
+        xp_hw = xp_rules.homework_xp(ai_score)
+        storage.award_xp(uid, xp_hw, xp_rules.SRC_CLASS_HOMEWORK,
+                         lesson_key=f"class:{lesson['date']}")
 
         exps = result.get("explanations", [])
         if not isinstance(exps, list):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import csv
+import json
 import tempfile
 from datetime import datetime
 from typing import Optional, List
@@ -11,8 +12,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import storage
-from ktp_plan import KTP_LESSONS, register_custom_lesson
-from utils import format_error_stats
+import xp_rules
+from ktp_plan import KTP_LESSONS, LESSON_BY_ID, register_custom_lesson
+from quiz_utils import safe_html
+from utils import format_error_stats, xp_lesson_label
 
 
 def _parse_ids(env_val: str) -> set[int]:
@@ -57,6 +60,88 @@ def _kb(*rows):
     return kb
 
 
+def is_group_teacher(user_id: int, group_id: int) -> bool:
+    """Учитель этого класса или админ."""
+    if is_admin(user_id):
+        return True
+    for g in storage.get_user_groups(user_id):
+        if int(g.get("group_id") or 0) == int(group_id) and g.get("role") == "teacher":
+            return True
+    return False
+
+
+def _lesson_sort_key(lesson_key: str):
+    lesson = LESSON_BY_ID.get(lesson_key)
+    if lesson:
+        return (0, lesson.semester, lesson.num, lesson_key)
+    return (1, 99, 99, lesson_key)
+
+
+def render_student_xp(user_id: int, name: str = "", max_rows: int = 30) -> str:
+    """Разбивка XP ученика по урокам — для панелей учителя и админа."""
+    rows = storage.get_xp_by_lesson(user_id)
+    title = f"🎁 <b>XP по урокам</b>\n{safe_html(name)}" if name else "🎁 <b>XP по урокам</b>"
+    if not rows:
+        return f"{title}\n\nНачислений пока нет."
+    rows.sort(key=lambda r: _lesson_sort_key(r["lesson_key"]))
+    lines = [title, ""]
+    for r in rows[:max_rows]:
+        lines.append(f"• {safe_html(xp_lesson_label(r['lesson_key']))} — <b>{r['xp']}</b> XP")
+    if len(rows) > max_rows:
+        lines.append(f"…и ещё {len(rows) - max_rows}.")
+    lines.append("")
+    lines.append(f"Итого: <b>{storage.get_user_xp(user_id)}</b> XP")
+    return "\n".join(lines)
+
+
+def render_group_xp(group_id: int, group_name: str, limit: int = 20) -> str:
+    """Сколько XP класс набрал по каждому уроку."""
+    totals = storage.get_group_lesson_xp_totals(group_id)
+    if not totals:
+        return (f"🎁 <b>XP по урокам — {safe_html(group_name)}</b>\n\n"
+                "Пока нет начислений у учеников этого класса.")
+    totals.sort(key=lambda t: _lesson_sort_key(t[0]))
+    lines = [f"🎁 <b>XP по урокам — {safe_html(group_name)}</b>", ""]
+    for key, total, students in totals[:limit]:
+        avg = round(total / students, 1) if students else 0
+        lines.append(f"• {safe_html(xp_lesson_label(key))}\n"
+                     f"   всего <b>{total}</b> XP · учеников {students} · в среднем {avg}")
+    if len(totals) > limit:
+        lines.append(f"\n…и ещё {len(totals) - limit} позиц. — смотри выгрузку CSV.")
+    return "\n".join(lines)
+
+
+def export_group_xp_csv(group_id: int, group_name: str, lesson_ids: List[str]) -> str:
+    out = os.path.join(tempfile.gettempdir(),
+                       f"group_xp_{group_name}_{_now_ymd()}.csv".replace(" ", "_"))
+    rows = storage.export_group_xp_rows(group_id, lesson_ids)
+    header = ["user_id", "first_name", "username", "xp_total", "xp_ledger_total"]
+    header += [f"xp_{lid}" for lid in lesson_ids]
+    header += ["xp_legacy", "xp_other"]
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    return out
+
+
+def group_ai_status_text(group_id: int) -> str:
+    ai_on = storage.get_group_setting(group_id, "ai_enabled") != "0"
+    hints_on = storage.get_group_setting(group_id, "hints_enabled") != "0"
+    return (f"🤖 ИИ-помощник: <b>{'включён' if ai_on else 'выключен'}</b>\n"
+            f"💡 Подсказки: <b>{'включены' if hints_on else 'выключены'}</b>")
+
+
+def group_ai_buttons(group_id: int, prefix: str) -> List:
+    ai_on = storage.get_group_setting(group_id, "ai_enabled") != "0"
+    hints_on = storage.get_group_setting(group_id, "hints_enabled") != "0"
+    return [
+        (f"🤖 ИИ: {'выключить' if ai_on else 'включить'}", f"{prefix}:ai_toggle:{group_id}"),
+        (f"💡 Подсказки: {'выключить' if hints_on else 'включить'}", f"{prefix}:hints_toggle:{group_id}"),
+    ]
+
+
 def register(bot):
     # ── /admin ────────────────────────────────────────────────────────────
     @bot.message_handler(commands=["admin"])
@@ -82,6 +167,7 @@ def register(bot):
             [("👥 Пользователи", "admin:users"), ("🏫 Классы", "admin:groups")],
             [("📢 Рассылка", "admin:broadcast"), ("📤 Экспорт CSV", "admin:export")],
             [("📄 Добавить упражнения", "admin:exercises")],
+            [(f"⚠️ Жалобы на вопросы ({storage.count_question_reports('new')})", "admin:reports")],
             [("❌ Закрыть", "admin:close")],
         )
 
@@ -201,7 +287,9 @@ def register(bot):
         if not is_admin(uid):
             bot.answer_callback_query(call.id); return
         bot.answer_callback_query(call.id)
-        gid = int(call.data.split(":")[2])
+        _render_group_view(call, int(call.data.split(":")[2]))
+
+    def _render_group_view(call, gid: int):
         g = storage.get_group(gid)
         if not g:
             bot.edit_message_text("Класс не найден.", call.message.chat.id, call.message.message_id)
@@ -216,7 +304,8 @@ def register(bot):
             f"Ученики: <b>{summary['students']}</b> | Учителя: <b>{summary['teachers']}</b>\n"
             f"Средний XP (ученики): <b>{summary['xp_avg']}</b>\n"
             f"Среднее пройдено уроков (КТП): <b>{summary['ktp_done_avg']}</b>\n\n"
-            f"<b>Частые ошибки класса:</b>\n{top_txt}"
+            f"<b>Частые ошибки класса:</b>\n{top_txt}\n\n"
+            f"{group_ai_status_text(gid)}"
         )
         bot.edit_message_text(
             text,
@@ -224,13 +313,170 @@ def register(bot):
             call.message.message_id,
             parse_mode="HTML",
             reply_markup=_kb_one_col([
+                ("🎁 XP по урокам", f"admin:group_xp:{gid}"),
+                ("👤 XP по ученикам", f"admin:group_xp_users:{gid}"),
                 ("👥 Список участников", f"admin:group_members:{gid}"),
+            ] + group_ai_buttons(gid, "admin") + [
                 ("📢 Рассылка в класс", f"admin:bc_group:{gid}"),
+                ("📤 Экспорт XP по урокам", f"admin:export_group_xp:{gid}"),
                 ("📤 Экспорт прогресса (КТП)", f"admin:export_group_progress:{gid}"),
                 ("📤 Экспорт участников", f"admin:export_group:{gid}"),
                 ("🏫 К списку классов", "admin:groups"),
             ]),
         )
+
+    # ── XP по урокам ──────────────────────────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:group_xp:"))
+    def on_group_xp(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id)
+        gid = int(call.data.split(":")[2])
+        g = storage.get_group(gid)
+        if not g:
+            bot.edit_message_text("Класс не найден.", call.message.chat.id, call.message.message_id)
+            return
+        bot.edit_message_text(
+            render_group_xp(gid, g["name"]),
+            call.message.chat.id, call.message.message_id, parse_mode="HTML",
+            reply_markup=_kb_one_col([
+                ("👤 XP по ученикам", f"admin:group_xp_users:{gid}"),
+                ("📤 Экспорт XP по урокам", f"admin:export_group_xp:{gid}"),
+                ("⬅️ К классу", f"admin:group:{gid}"),
+            ]),
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:group_xp_users:"))
+    def on_group_xp_users(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id)
+        gid = int(call.data.split(":")[2])
+        g = storage.get_group(gid)
+        if not g:
+            bot.edit_message_text("Класс не найден.", call.message.chat.id, call.message.message_id)
+            return
+        matrix = storage.get_group_lesson_xp_matrix(gid)
+        members = [m for m in storage.get_group_members(gid)
+                   if (m.get("role") or "student") == "student"]
+        buttons = []
+        lines = [f"👤 <b>XP по ученикам — {safe_html(g['name'])}</b>", ""]
+        for m in members[:30]:
+            mid_ = int(m["user_id"])
+            by_key = matrix.get(mid_, {})
+            with_xp = sum(1 for k, v in by_key.items() if v and k != storage.LEGACY_BUCKET_KEY)
+            name = m.get("first_name") or str(mid_)
+            lines.append(f"• {safe_html(name)} — <b>{m.get('xp', 0)}</b> XP · уроков с XP: {with_xp}")
+            buttons.append((f"👤 {name}", f"admin:user_xp:{gid}:{mid_}"))
+        if not members:
+            lines.append("В классе пока нет учеников.")
+        buttons.append(("⬅️ К классу", f"admin:group:{gid}"))
+        bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=_kb_one_col(buttons))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:user_xp:"))
+    def on_user_xp(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id)
+        _, _, gid_s, uid_s = call.data.split(":")
+        gid, target = int(gid_s), int(uid_s)
+        user = storage.get_user(target) or {}
+        bot.edit_message_text(
+            render_student_xp(target, user.get("first_name") or str(target)),
+            call.message.chat.id, call.message.message_id, parse_mode="HTML",
+            reply_markup=_kb_one_col([
+                ("⬅️ К ученикам", f"admin:group_xp_users:{gid}"),
+                ("🏫 К классу", f"admin:group:{gid}"),
+            ]),
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:export_group_xp:"))
+    def on_export_group_xp(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id)
+        gid = int(call.data.split(":")[2])
+        g = storage.get_group(gid)
+        if not g:
+            bot.send_message(call.message.chat.id, "Класс не найден.")
+            return
+        path = export_group_xp_csv(gid, g["name"], [l.lesson_id for l in KTP_LESSONS])
+        with open(path, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption=f"group_xp_{g['name']}.csv")
+
+    # ── Выключатель ИИ и подсказок ────────────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:ai_toggle:")
+                                or c.data.startswith("admin:hints_toggle:"))
+    def on_admin_feature_toggle(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        parts = call.data.split(":")
+        key = "ai_enabled" if parts[1] == "ai_toggle" else "hints_enabled"
+        gid = int(parts[2])
+        new_value = "0" if storage.get_group_setting(gid, key) != "0" else "1"
+        storage.set_group_setting(gid, key, new_value)
+        bot.answer_callback_query(
+            call.id,
+            ("🤖 ИИ" if key == "ai_enabled" else "💡 Подсказки") +
+            (" включены" if new_value == "1" else " выключены"),
+            show_alert=True,
+        )
+        _render_group_view(call, gid)
+
+    # ── Жалобы учеников на вопросы ────────────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data == "admin:reports"
+                                or c.data.startswith("admin:reports:"))
+    def on_reports(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id)
+        _render_reports(call, call.data.split(":")[2] if call.data.count(":") == 2 else "new")
+
+    def _render_reports(call, status: str = "new"):
+        reports = storage.list_question_reports(status, 8)
+        lines = [f"⚠️ <b>Жалобы на вопросы</b> ({'новые' if status == 'new' else 'все'})", ""]
+        buttons = []
+        if not reports:
+            lines.append("Жалоб нет 🎉")
+        for r in reports:
+            try:
+                options = json.loads(r.get("options_json") or "[]")
+            except Exception:
+                options = []
+            when = datetime.fromtimestamp(int(r.get("ts") or 0)).strftime("%d.%m %H:%M")
+            lines.append(
+                f"#{r['id']} · {when} · {safe_html(xp_lesson_label(r.get('lesson_key') or ''))}\n"
+                f"<code>{safe_html(r.get('question_id') or '—')}</code>\n"
+                f"{safe_html(r.get('question_text') or '')}\n"
+                f"Варианты: {safe_html(' | '.join(str(o) for o in options))}\n"
+                f"Ключ: <b>{safe_html(r.get('correct_text') or '—')}</b>\n"
+            )
+            if r.get("status") == "new":
+                buttons.append((f"✅ Обработано #{r['id']}", f"admin:report_done:{r['id']}"))
+        buttons.append(("🗂 Показать все", "admin:reports:all") if status == "new"
+                       else ("🆕 Только новые", "admin:reports:new"))
+        buttons.append(("⬅️ В админ-панель", "admin:home"))
+        bot.edit_message_text("\n".join(lines)[:4000], call.message.chat.id,
+                              call.message.message_id, parse_mode="HTML",
+                              reply_markup=_kb_one_col(buttons))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:report_done:"))
+    def on_report_done(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        storage.resolve_question_report(int(call.data.split(":")[2]))
+        bot.answer_callback_query(call.id, "Отмечено как обработанное.")
+        _render_reports(call, "new")
+
+    @bot.callback_query_handler(func=lambda c: c.data == "admin:home")
+    def on_admin_home(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text("🛠 <b>Админ-панель</b>\n\nВыбери действие:",
+                              call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=_admin_menu_kb())
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:group_members:"))
     def on_group_members(call):
@@ -826,30 +1072,179 @@ def register_join_commands(bot):
             return
         bot.send_message(msg.chat.id, f"✅ Вы добавлены как учитель в класс <b>{g['name']}</b>.\nКоманда: /teacher", parse_mode="HTML")
 
+    def _teacher_groups(user_id: int):
+        groups = [g for g in storage.get_user_groups(user_id) if g.get("role") == "teacher"]
+        if not groups and is_admin(user_id):
+            groups = storage.list_groups()
+        return groups
+
+    def _teacher_home_text(user_id: int):
+        groups = _teacher_groups(user_id)
+        lines = ["👩\u200d🏫 <b>Панель учителя</b>", ""]
+        for g in groups:
+            summary = storage.get_group_summary(int(g["group_id"]))
+            lines.append(
+                f"🏫 <b>{safe_html(g['name'])}</b>\n"
+                f"Ученики: {summary['students']} · Средний XP: {summary['xp_avg']}\n"
+                f"Среднее пройдено уроков (КТП): {summary['ktp_done_avg']}\n"
+            )
+        if not groups:
+            lines.append("У вас нет классов. Добавьтесь через <code>/teach КОД</code>.")
+        buttons = [(f"🏫 {g['name']}", f"teach:group:{g['group_id']}") for g in groups]
+        return "\n".join(lines), _kb_one_col(buttons) if buttons else None
+
     @bot.message_handler(commands=["teacher"])
     def on_teacher(msg):
         storage.init_db()
-        # Delete command message to keep chat clean
         try:
             bot.delete_message(msg.chat.id, msg.message_id)
         except Exception:
             pass
+        text, kb = _teacher_home_text(msg.from_user.id)
+        bot.send_message(msg.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
-        groups = storage.get_user_groups(msg.from_user.id)
-        teach_groups = [g for g in groups if g.get("role") == "teacher"]
-        if not teach_groups:
-            bot.send_message(msg.chat.id, "У вас нет классов учителя. Добавьтесь через /teach CODE.")
+    @bot.callback_query_handler(func=lambda c: c.data == "teach:home")
+    def on_teach_home(call):
+        bot.answer_callback_query(call.id)
+        text, kb = _teacher_home_text(call.from_user.id)
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=kb)
+
+    def _teach_group_screen(call, gid: int):
+        g = storage.get_group(gid)
+        if not g:
+            bot.edit_message_text("Класс не найден.", call.message.chat.id, call.message.message_id)
             return
+        summary = storage.get_group_summary(gid)
+        top = storage.get_group_top_errors(gid, 6)
+        bot.edit_message_text(
+            f"🏫 <b>{safe_html(g['name'])}</b>\n"
+            f"Код для учеников: <code>{g['join_code']}</code>\n\n"
+            f"Ученики: <b>{summary['students']}</b> · Средний XP: <b>{summary['xp_avg']}</b>\n"
+            f"Среднее пройдено уроков (КТП): <b>{summary['ktp_done_avg']}</b>\n\n"
+            f"<b>Частые ошибки класса:</b>\n{format_error_stats(top) if top else 'нет данных'}\n\n"
+            f"{group_ai_status_text(gid)}",
+            call.message.chat.id, call.message.message_id, parse_mode="HTML",
+            reply_markup=_kb_one_col([
+                ("🎁 XP по урокам", f"teach:xp:{gid}"),
+                ("👤 XP по ученикам", f"teach:students:{gid}"),
+            ] + group_ai_buttons(gid, "teach") + [
+                ("📤 Выгрузка XP (CSV)", f"teach:export:{gid}"),
+                ("ℹ️ Как начисляется XP", "teach:rules"),
+                ("⬅️ К списку классов", "teach:home"),
+            ]),
+        )
 
-        lines = ["👩\u200d🏫 <b>Панель учителя</b>"]
-        for g in teach_groups:
-            summary = storage.get_group_summary(int(g["group_id"]))
-            lines.append(
-                f"\n🏫 <b>{g['name']}</b>\n"
-                f"Ученики: {summary['students']} | Средний XP: {summary['xp_avg']}\n"
-                f"Среднее пройдено уроков (КТП): {summary['ktp_done_avg']}"
-            )
-        bot.send_message(msg.chat.id, "\n".join(lines), parse_mode="HTML")
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("teach:group:"))
+    def on_teach_group(call):
+        gid = int(call.data.split(":")[2])
+        if not is_group_teacher(call.from_user.id, gid):
+            bot.answer_callback_query(call.id, "Доступ только для учителя класса.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        _teach_group_screen(call, gid)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("teach:xp:"))
+    def on_teach_xp(call):
+        gid = int(call.data.split(":")[2])
+        if not is_group_teacher(call.from_user.id, gid):
+            bot.answer_callback_query(call.id, "Доступ только для учителя класса.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        g = storage.get_group(gid) or {"name": ""}
+        bot.edit_message_text(
+            render_group_xp(gid, g.get("name", "")),
+            call.message.chat.id, call.message.message_id, parse_mode="HTML",
+            reply_markup=_kb_one_col([
+                ("👤 XP по ученикам", f"teach:students:{gid}"),
+                ("📤 Выгрузка XP (CSV)", f"teach:export:{gid}"),
+                ("⬅️ К классу", f"teach:group:{gid}"),
+            ]),
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("teach:students:"))
+    def on_teach_students(call):
+        gid = int(call.data.split(":")[2])
+        if not is_group_teacher(call.from_user.id, gid):
+            bot.answer_callback_query(call.id, "Доступ только для учителя класса.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        g = storage.get_group(gid) or {"name": ""}
+        matrix = storage.get_group_lesson_xp_matrix(gid)
+        members = [m for m in storage.get_group_members(gid)
+                   if (m.get("role") or "student") == "student"]
+        lines = [f"👤 <b>Ученики — {safe_html(g.get('name', ''))}</b>", ""]
+        buttons = []
+        for m in members[:30]:
+            mid_ = int(m["user_id"])
+            by_key = matrix.get(mid_, {})
+            with_xp = sum(1 for k, v in by_key.items() if v and k != storage.LEGACY_BUCKET_KEY)
+            name = m.get("first_name") or str(mid_)
+            lines.append(f"• {safe_html(name)} — <b>{m.get('xp', 0)}</b> XP · уроков с XP: {with_xp}")
+            buttons.append((f"👤 {name}", f"teach:student:{gid}:{mid_}"))
+        if not members:
+            lines.append("В классе пока нет учеников.")
+        buttons.append(("⬅️ К классу", f"teach:group:{gid}"))
+        bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=_kb_one_col(buttons))
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("teach:student:"))
+    def on_teach_student(call):
+        _, _, gid_s, uid_s = call.data.split(":")
+        gid, target = int(gid_s), int(uid_s)
+        if not is_group_teacher(call.from_user.id, gid):
+            bot.answer_callback_query(call.id, "Доступ только для учителя класса.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id)
+        user = storage.get_user(target) or {}
+        bot.edit_message_text(
+            render_student_xp(target, user.get("first_name") or str(target)),
+            call.message.chat.id, call.message.message_id, parse_mode="HTML",
+            reply_markup=_kb_one_col([
+                ("⬅️ К ученикам", f"teach:students:{gid}"),
+                ("🏫 К классу", f"teach:group:{gid}"),
+            ]),
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("teach:export:"))
+    def on_teach_export(call):
+        gid = int(call.data.split(":")[2])
+        if not is_group_teacher(call.from_user.id, gid):
+            bot.answer_callback_query(call.id, "Доступ только для учителя класса.", show_alert=True)
+            return
+        bot.answer_callback_query(call.id, "Готовлю файл…")
+        g = storage.get_group(gid)
+        if not g:
+            return
+        path = export_group_xp_csv(gid, g["name"], [l.lesson_id for l in KTP_LESSONS])
+        with open(path, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption=f"XP по урокам — {g['name']}")
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("teach:ai_toggle:")
+                                or c.data.startswith("teach:hints_toggle:"))
+    def on_teach_feature_toggle(call):
+        parts = call.data.split(":")
+        gid = int(parts[2])
+        if not is_group_teacher(call.from_user.id, gid):
+            bot.answer_callback_query(call.id, "Доступ только для учителя класса.", show_alert=True)
+            return
+        key = "ai_enabled" if parts[1] == "ai_toggle" else "hints_enabled"
+        new_value = "0" if storage.get_group_setting(gid, key) != "0" else "1"
+        storage.set_group_setting(gid, key, new_value)
+        label_ = "🤖 ИИ-помощник" if key == "ai_enabled" else "💡 Подсказки"
+        bot.answer_callback_query(
+            call.id,
+            f"{label_} {'включён' if new_value == '1' else 'выключен'} для класса.",
+            show_alert=True,
+        )
+        _teach_group_screen(call, gid)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "teach:rules")
+    def on_teach_rules(call):
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(xp_rules.render_xp_rules_text(), call.message.chat.id,
+                              call.message.message_id, parse_mode="HTML",
+                              reply_markup=_kb_one_col([("⬅️ Назад", "teach:home")]))
 
 
 # ── Admin: pre-generate KTP lesson cache ─────────────────────────────────────
@@ -985,6 +1380,40 @@ def register_prewarm_command(bot):
             f"Пользователи: <b>{status['users']}</b>\n"
             f"Сохранённые уроки: <b>{status['cached_lessons']}</b>\n"
             f"Доп. темы: <b>{status['custom_topics']}</b>\n"
-            f"Строки прогресса КТП: <b>{status['ktp_progress_rows']}</b>",
+            f"Строки прогресса КТП: <b>{status['ktp_progress_rows']}</b>\n"
+            f"Записей в журнале XP: <b>{status['xp_ledger_rows']}</b>\n"
+            f"Жалоб на вопросы: <b>{status['question_reports']}</b>",
+            parse_mode="HTML",
+        )
+
+    @bot.message_handler(commands=["xp_backfill"])
+    def on_xp_backfill(msg):
+        """Пересчитать историю XP по урокам. Обычно не нужно: бот делает это сам при старте."""
+        uid = msg.from_user.id
+        if not is_admin(uid):
+            bot.reply_to(msg, "⛔️ Доступ запрещён.")
+            return
+        force = "force" in (msg.text or "").lower()
+        stats = storage.backfill_xp_ledger_once(force=force)
+        if stats.get("skipped"):
+            bot.reply_to(
+                msg,
+                "Пересчёт уже выполнялся. Чтобы повторить принудительно: "
+                "<code>/xp_backfill force</code>",
+                parse_mode="HTML",
+            )
+            return
+        mismatched = 0
+        for m in storage.get_top_users(50):
+            u_id = int(m["user_id"])
+            if storage.get_xp_ledger_total(u_id) != int(m.get("xp") or 0):
+                mismatched += 1
+        bot.reply_to(
+            msg,
+            "<b>🎁 Пересчёт XP по урокам</b>\n\n"
+            f"Учеников обработано: <b>{stats['users']}</b>\n"
+            f"Строк по урокам: <b>{stats['lesson_rows']}</b>\n"
+            f"Строк «до обновления»: <b>{stats['legacy_rows']}</b>\n"
+            f"Расхождений в топ-50: <b>{mismatched}</b>",
             parse_mode="HTML",
         )

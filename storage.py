@@ -151,6 +151,8 @@ def get_db_status() -> Dict[str, Any]:
         "cached_lessons": count("ktp_lesson_cache"),
         "custom_topics": count("custom_topics"),
         "ktp_progress_rows": count("ktp_lesson_progress"),
+        "xp_ledger_rows": count("xp_ledger"),
+        "question_reports": count("question_reports"),
     }
 
 
@@ -321,6 +323,64 @@ def init_db():
             );
         """)
 
+        # ── XP ledger: одна строка на каждое изменение XP ─────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS xp_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                ts INTEGER NOT NULL,
+                delta INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'legacy',
+                scope TEXT NOT NULL DEFAULT 'other',
+                lesson_key TEXT NOT NULL DEFAULT '',
+                note TEXT
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_xp_ledger_user_lesson ON xp_ledger(user_id, lesson_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_xp_ledger_user_ts ON xp_ledger(user_id, ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_xp_ledger_lesson ON xp_ledger(lesson_key)")
+        # Защита от двойного пересчёта истории: одна backfill-строка на (ученик, урок).
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_xp_ledger_backfill
+            ON xp_ledger(user_id, lesson_key) WHERE source='backfill'
+        """)
+
+        # ── Служебные флаги приложения (например, отметка о backfill) ─────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
+
+        # ── Настройки класса (выключатель ИИ и подсказок) ─────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS group_settings (
+                group_id INTEGER,
+                key TEXT,
+                value TEXT,
+                updated_ts INTEGER,
+                PRIMARY KEY (group_id, key)
+            );
+        """)
+
+        # ── Жалобы учеников на вопросы ────────────────────────────────────
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS question_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                lesson_key TEXT NOT NULL DEFAULT '',
+                question_id TEXT NOT NULL DEFAULT '',
+                question_text TEXT,
+                options_json TEXT,
+                correct_text TEXT,
+                comment TEXT,
+                ts INTEGER,
+                status TEXT NOT NULL DEFAULT 'new'
+            );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_question_reports_status ON question_reports(status, ts)")
+
         # ── Custom topics (admin-uploaded documents) ────────────────────────
         cur.execute("""
             CREATE TABLE IF NOT EXISTS custom_topics (
@@ -380,12 +440,78 @@ def set_language_level(user_id: int, level: str):
         con.commit()
 
 
-def add_xp(user_id: int, delta: int):
+LEGACY_BUCKET_KEY = "__legacy__"   # корзина «до обновления» в журнале XP
+
+
+def _scope_for(lesson_key: str) -> str:
+    """Определяет раздел по ключу урока (см. award_xp)."""
+    key = (lesson_key or "").strip()
+    if not key:
+        return "global"
+    if key == LEGACY_BUCKET_KEY:
+        return "other"
+    if key.startswith("mod:"):
+        return "module"
+    if key.startswith("class:"):
+        return "class"
+    if key.startswith("s") and "_" in key:
+        return "ktp"
+    return "other"
+
+
+def award_xp(
+    user_id: int,
+    delta: int,
+    source: str,
+    lesson_key: Optional[str] = None,
+    note: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> int:
+    """Изменить XP ученика И записать это в журнал xp_ledger одной транзакцией.
+
+    lesson_key: 's1_09' (КТП) | 'mod:<module>:<level>' (тренажёры) |
+                'class:<YYYY-MM-DD>' (урок класса) | '' (стрик, входной тест).
+
+    Возвращает ФАКТИЧЕСКИ применённую дельту: users.xp не уходит ниже нуля,
+    поэтому списание может оказаться меньше запрошенного. В журнал пишется
+    именно применённое значение — иначе сумма по урокам не сойдётся с общим XP.
+    """
+    key = (lesson_key or "").strip()
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return 0
+    if delta == 0:
+        return 0
+
     con = _get_con()
     with _lock:
         cur = con.cursor()
-        cur.execute("UPDATE users SET xp = MAX(0, COALESCE(xp, 0) + ?) WHERE user_id=?", (delta, user_id))
+        cur.execute("SELECT COALESCE(xp, 0) FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            return 0  # неизвестный пользователь: ведём себя как старый add_xp
+        current = int(row[0] or 0)
+        applied = delta if delta >= 0 else max(delta, -current)
+        if applied == 0:
+            return 0
+        cur.execute(
+            "UPDATE users SET xp = MAX(0, COALESCE(xp, 0) + ?) WHERE user_id=?",
+            (applied, user_id),
+        )
+        cur.execute(
+            "INSERT INTO xp_ledger(user_id, ts, delta, source, scope, lesson_key, note)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (user_id, _now_ts(), applied, source or "legacy",
+             scope or _scope_for(key), key, note),
+        )
         con.commit()
+    return applied
+
+
+def add_xp(user_id: int, delta: int):
+    """Устаревшее: используйте award_xp(). Оставлено, чтобы ничего не сломалось."""
+    return award_xp(user_id, delta, "legacy")
 
 
 def get_user_xp(user_id: int) -> int:
@@ -395,6 +521,144 @@ def get_user_xp(user_id: int) -> int:
     cur.execute("SELECT xp FROM users WHERE user_id=?", (user_id,))
     row = cur.fetchone()
     return int(row[0] or 0) if row else 0
+
+
+# ── XP ledger: чтение ────────────────────────────────────────────────────────
+def get_xp_by_lesson(user_id: int) -> List[Dict[str, Any]]:
+    """[{lesson_key, scope, xp, entries, last_ts}, ...] — только ненулевые суммы."""
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT lesson_key, MIN(scope), SUM(delta), COUNT(*), MAX(ts)
+        FROM xp_ledger WHERE user_id=?
+        GROUP BY lesson_key
+        HAVING SUM(delta) <> 0
+        ORDER BY lesson_key
+    """, (user_id,))
+    return [
+        {"lesson_key": r[0] or "", "scope": r[1] or "other",
+         "xp": int(r[2] or 0), "entries": int(r[3] or 0), "last_ts": int(r[4] or 0)}
+        for r in cur.fetchall()
+    ]
+
+
+def get_lesson_xp(user_id: int, lesson_key: str) -> int:
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("SELECT COALESCE(SUM(delta), 0) FROM xp_ledger WHERE user_id=? AND lesson_key=?",
+                (user_id, (lesson_key or "").strip()))
+    return int(cur.fetchone()[0] or 0)
+
+
+def get_xp_by_source(user_id: int) -> List[Tuple[str, int]]:
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT source, SUM(delta) FROM xp_ledger WHERE user_id=?
+        GROUP BY source ORDER BY SUM(delta) DESC
+    """, (user_id,))
+    return [(r[0] or "legacy", int(r[1] or 0)) for r in cur.fetchall()]
+
+
+def get_xp_ledger_total(user_id: int) -> int:
+    """Сумма журнала. Должна совпадать с users.xp — это самопроверка."""
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("SELECT COALESCE(SUM(delta), 0) FROM xp_ledger WHERE user_id=?", (user_id,))
+    return int(cur.fetchone()[0] or 0)
+
+
+def get_xp_recent(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT ts, delta, source, lesson_key, note FROM xp_ledger
+        WHERE user_id=? ORDER BY ts DESC, id DESC LIMIT ?
+    """, (user_id, int(limit)))
+    return [
+        {"ts": int(r[0] or 0), "delta": int(r[1] or 0), "source": r[2] or "legacy",
+         "lesson_key": r[3] or "", "note": r[4]}
+        for r in cur.fetchall()
+    ]
+
+
+def get_group_lesson_xp_matrix(group_id: int) -> Dict[int, Dict[str, int]]:
+    """{user_id: {lesson_key: xp}} одним запросом (без N+1 по ученикам и урокам)."""
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT l.user_id, l.lesson_key, SUM(l.delta)
+        FROM xp_ledger l
+        JOIN group_members gm ON gm.user_id = l.user_id
+        WHERE gm.group_id=? AND gm.role='student'
+        GROUP BY l.user_id, l.lesson_key
+    """, (group_id,))
+    out: Dict[int, Dict[str, int]] = {}
+    for uid, key, total in cur.fetchall():
+        out.setdefault(int(uid), {})[key or ""] = int(total or 0)
+    return out
+
+
+def get_group_lesson_xp_totals(group_id: int) -> List[Tuple[str, int, int]]:
+    """[(lesson_key, сумма XP класса, сколько учеников получали XP), ...]."""
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT l.lesson_key, SUM(l.delta), COUNT(DISTINCT l.user_id)
+        FROM xp_ledger l
+        JOIN group_members gm ON gm.user_id = l.user_id
+        WHERE gm.group_id=? AND gm.role='student'
+        GROUP BY l.lesson_key
+        HAVING SUM(l.delta) <> 0
+        ORDER BY SUM(l.delta) DESC
+    """, (group_id,))
+    return [(r[0] or "", int(r[1] or 0), int(r[2] or 0)) for r in cur.fetchall()]
+
+
+def export_group_xp_rows(group_id: int, lesson_ids: List[str]) -> List[Dict[str, Any]]:
+    """Строки для CSV: по ученику — общий XP и XP по каждому уроку."""
+    members = [m for m in get_group_members(group_id) if (m.get("role") or "student") == "student"]
+    matrix = get_group_lesson_xp_matrix(group_id)
+    rows: List[Dict[str, Any]] = []
+    for m in members:
+        uid = int(m["user_id"])
+        by_key = matrix.get(uid, {})
+        row: Dict[str, Any] = {
+            "user_id": uid,
+            "first_name": m.get("first_name") or "",
+            "username": m.get("username") or "",
+            "xp_total": int(m.get("xp") or 0),
+            "xp_ledger_total": sum(by_key.values()),
+        }
+        for lid in lesson_ids:
+            row[f"xp_{lid}"] = by_key.get(lid, 0)
+        row["xp_legacy"] = by_key.get(LEGACY_BUCKET_KEY, 0)
+        known = set(lesson_ids) | {LEGACY_BUCKET_KEY}
+        row["xp_other"] = sum(v for k, v in by_key.items() if k not in known)
+        rows.append(row)
+    rows.sort(key=lambda r: r["xp_total"], reverse=True)
+    return rows
+
+
+# ── Служебные флаги ──────────────────────────────────────────────────────────
+def get_meta(key: str, default: str = "") -> str:
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("SELECT value FROM app_meta WHERE key=?", (key,))
+    row = cur.fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_meta(key: str, value: str) -> None:
+    con = _get_con()
+    with _lock:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO app_meta(key, value) VALUES (?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        con.commit()
 
 
 def update_streak(user_id: int, today_ymd: str) -> Tuple[int, bool]:
@@ -1049,3 +1313,268 @@ def get_custom_semesters() -> List[int]:
 def save_custom_exercises(lesson_id: str, package: Dict[str, Any]) -> None:
     """Save parsed exercises as a KTP lesson cache entry."""
     set_ktp_cache(lesson_id, package)
+
+
+# ── Настройки класса: выключатель ИИ и подсказок ─────────────────────────────
+GROUP_SETTING_DEFAULTS: Dict[str, str] = {
+    "ai_enabled": "1",
+    "hints_enabled": "1",
+}
+
+
+def get_group_setting(group_id: int, key: str, default: Optional[str] = None) -> str:
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("SELECT value FROM group_settings WHERE group_id=? AND key=?", (group_id, key))
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        return str(row[0])
+    if default is not None:
+        return default
+    return GROUP_SETTING_DEFAULTS.get(key, "")
+
+
+def set_group_setting(group_id: int, key: str, value: str) -> None:
+    con = _get_con()
+    with _lock:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO group_settings(group_id, key, value, updated_ts) VALUES (?,?,?,?)
+            ON CONFLICT(group_id, key) DO UPDATE SET
+                value=excluded.value, updated_ts=excluded.updated_ts
+        """, (group_id, key, str(value), _now_ts()))
+        con.commit()
+
+
+def _feature_enabled_for(user_id: int, key: str) -> bool:
+    """Запрет строже разрешения: если хоть в одном классе ученика выключено — выключено.
+
+    Учителей ограничение не касается: роль 'teacher' в группе не учитывается,
+    чтобы учитель мог сам проверить задание с включённым ИИ.
+    """
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT gs.value FROM group_members gm
+        JOIN group_settings gs ON gs.group_id = gm.group_id AND gs.key = ?
+        WHERE gm.user_id = ? AND COALESCE(gm.role, 'student') = 'student'
+    """, (key, user_id))
+    for (value,) in cur.fetchall():
+        if str(value) == "0":
+            return False
+    return True
+
+
+def is_ai_enabled_for(user_id: int) -> bool:
+    """Разрешён ли ученику встроенный ИИ (письменные задания)."""
+    return _feature_enabled_for(user_id, "ai_enabled")
+
+
+def are_hints_enabled_for(user_id: int) -> bool:
+    """Разрешены ли ученику подсказки."""
+    return _feature_enabled_for(user_id, "hints_enabled")
+
+
+# ── Жалобы на вопросы ────────────────────────────────────────────────────────
+def add_question_report(
+    user_id: int,
+    lesson_key: str,
+    question: Dict[str, Any],
+    correct_text: str = "",
+    comment: str = "",
+) -> int:
+    con = _get_con()
+    with _lock:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO question_reports(
+                user_id, lesson_key, question_id, question_text,
+                options_json, correct_text, comment, ts, status)
+            VALUES (?,?,?,?,?,?,?,?,'new')
+        """, (
+            user_id,
+            (lesson_key or "").strip(),
+            str((question or {}).get("id") or ""),
+            str((question or {}).get("q") or ""),
+            json.dumps((question or {}).get("options") or [], ensure_ascii=False),
+            correct_text or "",
+            comment or "",
+            _now_ts(),
+        ))
+        con.commit()
+        return int(cur.lastrowid)
+
+
+def has_recent_question_report(user_id: int, question_text: str, within_sec: int = 3600) -> bool:
+    """Защита от случайного двойного нажатия «Ошибка в вопросе»."""
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT 1 FROM question_reports
+        WHERE user_id=? AND question_text=? AND ts >= ?
+        LIMIT 1
+    """, (user_id, question_text or "", _now_ts() - int(within_sec)))
+    return cur.fetchone() is not None
+
+
+def list_question_reports(status: str = "new", limit: int = 20) -> List[Dict[str, Any]]:
+    con = _get_con()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    if status == "all":
+        cur.execute("SELECT * FROM question_reports ORDER BY ts DESC LIMIT ?", (int(limit),))
+    else:
+        cur.execute("SELECT * FROM question_reports WHERE status=? ORDER BY ts DESC LIMIT ?",
+                    (status, int(limit)))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.row_factory = None
+    return rows
+
+
+def count_question_reports(status: str = "new") -> int:
+    con = _get_con()
+    cur = con.cursor()
+    if status == "all":
+        cur.execute("SELECT COUNT(*) FROM question_reports")
+    else:
+        cur.execute("SELECT COUNT(*) FROM question_reports WHERE status=?", (status,))
+    return int(cur.fetchone()[0] or 0)
+
+
+def resolve_question_report(report_id: int) -> None:
+    con = _get_con()
+    with _lock:
+        cur = con.cursor()
+        cur.execute("UPDATE question_reports SET status='done' WHERE id=?", (int(report_id),))
+        con.commit()
+
+
+# ── Разовый пересчёт истории XP по урокам ────────────────────────────────────
+XP_BACKFILL_KEY = "xp_ledger_backfill_v1"
+
+
+def _writing_xp_history(user_id: int, lesson_id: str) -> int:
+    """Проигрывает письменные попытки ученика по уроку и суммирует XP за них."""
+    import xp_rules
+
+    con = _get_con()
+    cur = con.cursor()
+    cur.execute("""
+        SELECT result_json FROM writing_submissions
+        WHERE user_id=? AND lesson_id=? ORDER BY ts ASC, id ASC
+    """, (user_id, lesson_id))
+    rows = cur.fetchall()
+    if not rows:
+        return 0
+
+    total = 0
+    best = 0
+    for i, (result_json,) in enumerate(rows):
+        try:
+            result = json.loads(result_json or "{}")
+        except Exception:
+            result = {}
+        scores = result.get("scores") or {}
+        overall = int(scores.get("overall", result.get("score", 0)) or 0)
+        coherence = int(scores.get("coherence", 1) or 0)
+        total += xp_rules.ktp_writing_xp(i == 0, overall, coherence, best)
+        best = max(best, overall)
+    return total
+
+
+def backfill_xp_ledger_once(force: bool = False) -> Dict[str, int]:
+    """Восстановить историю XP по урокам для учеников, которые занимались до журнала.
+
+    Идемпотентно: вызывается при каждом старте бота, но выполняется один раз.
+    Инвариант после выполнения: SUM(xp_ledger.delta) == users.xp для каждого ученика.
+    """
+    import xp_rules
+
+    _get_con()  # гарантируем, что база готова
+    if get_meta(XP_BACKFILL_KEY) and not force:
+        return {"skipped": 1, "users": 0, "lesson_rows": 0, "legacy_rows": 0}
+
+    con = _get_con()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("SELECT user_id, COALESCE(xp, 0) AS xp FROM users")
+    users = [(int(r["user_id"]), int(r["xp"] or 0)) for r in cur.fetchall()]
+    con.row_factory = None
+
+    stats = {"skipped": 0, "users": 0, "lesson_rows": 0, "legacy_rows": 0}
+
+    for user_id, user_xp in users:
+        if force:
+            with _lock:
+                con.cursor().execute(
+                    "DELETE FROM xp_ledger WHERE user_id=? AND source='backfill'", (user_id,))
+                con.commit()
+
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        cur.execute("SELECT * FROM ktp_lesson_progress WHERE user_id=?", (user_id,))
+        progress_rows = [dict(r) for r in cur.fetchall()]
+        con.row_factory = None
+
+        for row in progress_rows:
+            lesson_id = str(row.get("lesson_id") or "")
+            if not lesson_id:
+                continue
+            practice_best = int(row.get("practice_best") or 0)
+            exam_best = int(row.get("exam_best") or 0)
+
+            practice_xp = practice_best * xp_rules.XP_KTP_PRACTICE_PER_POINT
+
+            pack = get_ktp_cache(lesson_id) or {}
+            exam_total = len(pack.get("exam") or []) or 8
+            exam_xp = exam_best * xp_rules.XP_KTP_EXAM_PER_POINT
+            if exam_best >= xp_rules.exam_pass_threshold(exam_total):
+                exam_xp += xp_rules.XP_KTP_EXAM_FIRST_PASS
+
+            writing_xp = _writing_xp_history(user_id, lesson_id)
+            if not writing_xp and int(row.get("writing_attempts") or 0) > 0:
+                writing_xp = (
+                    xp_rules.XP_KTP_WRITING_FIRST_BASE
+                    + int(row.get("writing_best") or 0) * xp_rules.XP_KTP_WRITING_PER_OVERALL
+                )
+
+            lesson_xp = practice_xp + exam_xp + writing_xp
+            if lesson_xp <= 0:
+                continue
+
+            note = json.dumps(
+                {"practice": practice_xp, "exam": exam_xp, "writing": writing_xp},
+                ensure_ascii=False,
+            )
+            with _lock:
+                c = con.cursor()
+                c.execute("""
+                    INSERT OR IGNORE INTO xp_ledger(
+                        user_id, ts, delta, source, scope, lesson_key, note)
+                    VALUES (?,?,?,?,?,?,?)
+                """, (user_id, int(row.get("updated_ts") or _now_ts()), lesson_xp,
+                      xp_rules.SRC_BACKFILL, "ktp", lesson_id, note))
+                if c.rowcount:
+                    stats["lesson_rows"] += 1
+                con.commit()
+
+        # Остаток считаем ПОСЛЕ вставки уроков и по всему журналу,
+        # поэтому порядок вызова относительно живых начислений не важен.
+        remainder = user_xp - get_xp_ledger_total(user_id)
+        if remainder != 0:
+            with _lock:
+                c = con.cursor()
+                c.execute("""
+                    INSERT OR IGNORE INTO xp_ledger(
+                        user_id, ts, delta, source, scope, lesson_key, note)
+                    VALUES (?,?,?,?,?,?,?)
+                """, (user_id, _now_ts(), remainder, xp_rules.SRC_BACKFILL,
+                      "other", LEGACY_BUCKET_KEY, "до обновления"))
+                if c.rowcount:
+                    stats["legacy_rows"] += 1
+                con.commit()
+
+        stats["users"] += 1
+
+    set_meta(XP_BACKFILL_KEY, str(_now_ts()))
+    return stats

@@ -14,7 +14,9 @@ from ktp_plan import TAG_TO_RECOMMEND, LESSON_BY_ID, load_custom_lessons_from_db
 from content import TEST_QUESTIONS, MODULES, MODULE_ORDER, ACHIEVEMENTS
 from ai import evaluate_morphology_writing
 from quiz_utils import add_quiz_result, build_answer_review, safe_correct_idx, safe_html
-from utils import format_tags, format_error_stats, label, TAG_LABELS, truncate_text
+from question_reports import report_question
+from utils import format_tags, format_error_stats, label, TAG_LABELS, truncate_text, xp_lesson_label
+import xp_rules
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -28,12 +30,15 @@ admin.register_join_commands(bot)
 admin.register(bot)
 admin.register_prewarm_command(bot)
 
-CTRL_THRESHOLD = 5   # out of 8 for self-study
-XP_CTRL = 30
-HINT_COST = 2
+CTRL_THRESHOLD = xp_rules.MODULE_CTRL_THRESHOLD   # out of 8 for self-study
+XP_CTRL = xp_rules.XP_MODULE_CTRL
+HINT_COST = xp_rules.HINT_COST
 
 HINTS = class_handlers.HINTS
 DEFAULT_HINT = class_handlers.DEFAULT_HINT
+
+AI_OFF_TEXT = "🔒 Учитель отключил ИИ-помощника для вашего класса."
+HINTS_OFF_TEXT = "🔒 Учитель отключил подсказки для вашего класса."
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def today_ymd(): return datetime.now().strftime("%Y-%m-%d")
@@ -90,10 +95,7 @@ def lang_level_from_score(s):
     return "A1" if s <= 3 else ("A2" if s <= 7 else "B1")
 
 def rank_from_xp(xp):
-    if xp < 100:  return "🌱 Новичок"
-    if xp < 300:  return "🔍 Исследователь"
-    if xp < 600:  return "🧠 Знаток"
-    return "🌍 Посол культуры"
+    return xp_rules.rank_from_xp(xp)
 
 def maybe_unlock(uid, code):
     if storage.unlock_achievement(uid, code):
@@ -109,8 +111,8 @@ def update_meta(uid):
     xp = int(u.get("xp", 0) or 0)
     streak = int(u.get("streak", 0) or 0)
     if streak >= 3: maybe_unlock(uid, "streak_3")
-    if xp >= 100: maybe_unlock(uid, "xp_100")
-    if xp >= 300: maybe_unlock(uid, "xp_300")
+    if xp >= xp_rules.ACH_XP_THRESHOLDS[0]: maybe_unlock(uid, "xp_100")
+    if xp >= xp_rules.ACH_XP_THRESHOLDS[1]: maybe_unlock(uid, "xp_300")
     done = count_completed_levels(uid)
     if done >= 1: maybe_unlock(uid, "first_lesson")
     if done >= 3: maybe_unlock(uid, "three_lessons")
@@ -133,6 +135,13 @@ def kb_main():
     kb.add(InlineKeyboardButton("🏆 Лидеры", callback_data="menu:leaders"),
            InlineKeyboardButton("👤 Профиль", callback_data="menu:profile"))
     kb.add(InlineKeyboardButton("ℹ️ Помощь", callback_data="menu:help"))
+    return kb
+
+
+def kb_help():
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🎁 Как начисляется XP", callback_data="xp:rules"))
+    kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
     return kb
 
 
@@ -167,7 +176,7 @@ def on_start(msg):
     storage.upsert_user(uid, msg.from_user.first_name, msg.from_user.username)
     maybe_unlock(uid, "first_start")
     streak, changed = storage.update_streak(uid, today_ymd())
-    if changed: storage.add_xp(uid, 5)
+    if changed: storage.award_xp(uid, xp_rules.streak_xp(), xp_rules.SRC_STREAK)
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📖 В классе", callback_data="mode:class"),
            InlineKeyboardButton("🏠 Самостоятельно", callback_data="mode:home"))
@@ -247,10 +256,56 @@ def on_menu(call):
             "  Все уроки доступны сразу.\n\n"
             "🧠 <b>Тренажёры</b> — дополнительные модули морфологии (3 уровня).\n\n"
             "🏫 <b>Мой класс</b> — подключение к группе: /join CODE (ученик) · /teach CODE (учитель).\n\n"
-            "✍️ <b>ИИ проверяет</b>: грамматику, орфографию, связность/логику и лексику.\n"
-            "💡 <b>Подсказки</b> — доступны в каждом вопросе (−2 XP).\n"
-            "🏆 <b>Ранги</b> — растут по XP.",
-            call.message.chat.id, call.message.message_id, reply_markup=kb_main())
+            "✍️ <b>ИИ проверяет</b>: грамматику, орфографию, связность/логику и лексику.\n\n"
+            "🎁 <b>XP</b> — баллы за прогресс. Правила начисления — на отдельном экране ниже.",
+            call.message.chat.id, call.message.message_id, reply_markup=kb_help())
+
+def render_xp_by_lesson(uid, title="🎁 <b>XP по урокам</b>", max_rows=25):
+    """Текст разбивки XP по урокам. Используется и учеником, и учителем."""
+    rows = storage.get_xp_by_lesson(uid)
+    if not rows:
+        return (f"{title}\n\nПока нет начислений. Пройди практику или мини‑контрольную "
+                "в учебном плане — и здесь появится разбивка по урокам.")
+
+    order = {"ktp": 0, "module": 1, "class": 2, "global": 3, "other": 4}
+
+    def sort_key(r):
+        key = r["lesson_key"]
+        lesson = LESSON_BY_ID.get(key)
+        return (order.get(r["scope"], 5), (lesson.semester, lesson.num) if lesson else (99, 99), key)
+
+    rows.sort(key=sort_key)
+    lines = [title, ""]
+    for r in rows[:max_rows]:
+        lines.append(f"• {safe_html(xp_lesson_label(r['lesson_key']))} — <b>{r['xp']}</b> XP")
+    if len(rows) > max_rows:
+        lines.append(f"…и ещё {len(rows) - max_rows} позиц. в выгрузке учителя.")
+    lines.append("")
+    lines.append(f"Итого: <b>{storage.get_user_xp(uid)}</b> XP")
+    return "\n".join(lines)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "xp:rules")
+def on_xp_rules(call):
+    bot.answer_callback_query(call.id)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🎁 XP по урокам", callback_data="ktp:xp"))
+    kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
+    bot.edit_message_text(xp_rules.render_xp_rules_text(), call.message.chat.id,
+                          call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "ktp:xp")
+def on_xp_by_lesson(call):
+    bot.answer_callback_query(call.id)
+    uid = call.from_user.id
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("ℹ️ Как начисляется XP", callback_data="xp:rules"))
+    kb.add(InlineKeyboardButton("📘 К семестрам", callback_data="menu:ktp"))
+    kb.add(InlineKeyboardButton("⬅️ В меню", callback_data="nav:menu"))
+    bot.edit_message_text(render_xp_by_lesson(uid), call.message.chat.id,
+                          call.message.message_id, reply_markup=kb, parse_mode="HTML")
+
 
 @bot.callback_query_handler(func=lambda c: c.data == "nav:menu")
 def on_nav_menu(call):
@@ -346,6 +401,8 @@ def show_profile(chat_id, msg_id, uid):
               for c in ach[-3:] if c in ACHIEVEMENTS]
 
     kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🎁 XP по урокам", callback_data="ktp:xp"),
+           InlineKeyboardButton("ℹ️ Как начисляется XP", callback_data="xp:rules"))
     kb.add(InlineKeyboardButton("🔄 Сменить режим", callback_data="profile:switch_mode"))
     kb.add(InlineKeyboardButton("📚 К модулям", callback_data="menu:home"),
            InlineKeyboardButton("📅 К урокам", callback_data="menu:class"))
@@ -476,7 +533,7 @@ def on_test_ans(call):
     if ok:
         sc += 1
         if storage.get_progress(uid, "test_award_xp", "1") == "1":
-            storage.add_xp(uid, 2)
+            storage.award_xp(uid, xp_rules.diag_correct_xp(), xp_rules.SRC_DIAG_TEST)
     storage.set_progress(uid, "test_score", str(sc))
     storage.set_progress(
         uid,
@@ -537,7 +594,7 @@ def on_level(call):
     kb.add(InlineKeyboardButton(label, callback_data=f"tasks:start:{mid}:{lvl}"))
     if tasks_done and not ctrl_passed:
         kb.add(InlineKeyboardButton("📝 Контрольная", callback_data=f"ctrl:start:{mid}:{lvl}"))
-    if lev.get("open_task_prompt") and not ctrl_passed and tasks_done:
+    if lev.get("open_task_prompt") and not ctrl_passed and tasks_done and storage.is_ai_enabled_for(uid):
         kb.add(InlineKeyboardButton("✍️ Письменное (ИИ)", callback_data=f"open:start:{mid}:{lvl}"))
     kb.add(InlineKeyboardButton("🃏 Карточки", callback_data=f"flash:{mid}"))
     kb.add(InlineKeyboardButton(f"⬅️ {mod['emoji']} Модуль", callback_data=f"module:{mid}"))
@@ -572,7 +629,9 @@ def _send_task(chat_id, msg_id, uid, mid, lvl):
     kb = InlineKeyboardMarkup(row_width=1)
     for i, o in enumerate(task["options"]):
         kb.add(InlineKeyboardButton(o, callback_data=f"taskans:{mid}:{lvl}:{idx}:{i}"))
-    kb.add(InlineKeyboardButton(f"💡 Подсказка (−{HINT_COST} XP)", callback_data=f"hint:{mid}:{lvl}:{idx}"))
+    if storage.are_hints_enabled_for(uid):
+        kb.add(InlineKeyboardButton(f"💡 Подсказка (−{HINT_COST} XP)", callback_data=f"hint:{mid}:{lvl}:{idx}"))
+    kb.add(InlineKeyboardButton("⚠️ Ошибка в вопросе", callback_data=f"qreport:t:{mid}:{lvl}:{idx}"))
     kb.add(InlineKeyboardButton(f"⬅️ К уровню", callback_data=f"level:{mid}:{lvl}"))
     bot.edit_message_text(
         f"🧩 <b>Задание</b> ({idx+1}/{len(tasks)})\n\n{safe_html(task['q'])}",
@@ -583,6 +642,9 @@ def on_hint(call):
     parts = call.data.split(":")
     mid, lvl, idx = parts[1], int(parts[2]), int(parts[3])
     uid = call.from_user.id
+    if not storage.are_hints_enabled_for(uid):
+        bot.answer_callback_query(call.id, HINTS_OFF_TEXT, show_alert=True)
+        return
     # Check XP balance before deducting
     current_xp = storage.get_user_xp(uid)
     if current_xp < HINT_COST:
@@ -591,9 +653,22 @@ def on_hint(call):
     task = MODULES[mid]["levels"][lvl]["tasks"][idx]
     tag = task.get("tag", "")
     hint = HINTS.get(tag, DEFAULT_HINT)
-    storage.add_xp(uid, -HINT_COST)
+    storage.award_xp(uid, -HINT_COST, xp_rules.SRC_HINT, lesson_key=f"mod:{mid}:{lvl}")
     storage.increment_hint_used(uid)
     bot.answer_callback_query(call.id, hint, show_alert=True)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("qreport:"))
+def on_question_report(call):
+    uid = call.from_user.id
+    parts = call.data.split(":")
+    kind, mid, lvl, idx = parts[1], parts[2], int(parts[3]), int(parts[4])
+    level = MODULES.get(mid, {}).get("levels", {}).get(lvl, {})
+    items = level.get("tasks" if kind == "t" else "control_test", [])
+    if idx >= len(items):
+        bot.answer_callback_query(call.id)
+        return
+    report_question(bot, uid, f"mod:{mid}:{lvl}", items[idx], call)
+
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("taskans:"))
 def on_task_ans(call):
@@ -608,7 +683,8 @@ def on_task_ans(call):
     ok = chosen == correct_idx
     if ok:
         if storage.get_progress(uid, "lesson_award_xp", "1") == "1":
-            storage.add_xp(uid, task.get("xp", {1:5,2:10,3:15}[lvl]))
+            storage.award_xp(uid, xp_rules.module_task_xp(lvl, task.get("xp")),
+                             xp_rules.SRC_MODULE_TASK, lesson_key=f"mod:{mid}:{lvl}")
         c = int(storage.get_progress(uid, "lesson_correct", "0")) + 1
         storage.set_progress(uid, "lesson_correct", str(c))
     storage.set_progress(
@@ -629,7 +705,7 @@ def _finish_tasks(chat_id, msg_id, uid, mid, lvl):
     ctrl_passed = storage.is_level_ctrl_passed(uid, mid, lvl)
     has_open = bool(MODULES[mid]["levels"][lvl].get("open_task_prompt"))
     kb = InlineKeyboardMarkup()
-    if has_open and not ctrl_passed:
+    if has_open and not ctrl_passed and storage.is_ai_enabled_for(uid):
         kb.add(InlineKeyboardButton("✍️ Письменное задание (ИИ)", callback_data=f"open:start:{mid}:{lvl}"))
     if not ctrl_passed:
         kb.add(InlineKeyboardButton("📝 Контрольная работа", callback_data=f"ctrl:start:{mid}:{lvl}"))
@@ -652,10 +728,13 @@ def _finish_tasks(chat_id, msg_id, uid, mid, lvl):
 # ── Home: open text (AI) ──────────────────────────────────────────────────────
 @bot.callback_query_handler(func=lambda c: c.data.startswith("open:start:"))
 def on_open_start(call):
+    uid = call.from_user.id
+    if not storage.is_ai_enabled_for(uid):
+        bot.answer_callback_query(call.id, AI_OFF_TEXT, show_alert=True)
+        return
     bot.answer_callback_query(call.id)
     parts = call.data.split(":")
     mid, lvl = parts[2], int(parts[3])
-    uid = call.from_user.id
     prompt = MODULES[mid]["levels"][lvl].get("open_task_prompt")
     if not prompt:
         return
@@ -689,6 +768,11 @@ def on_open_cancel(call):
 @bot.message_handler(func=lambda m: storage.get_progress(m.from_user.id, "mode", "") == "awaiting_open_text" and not is_command_text(m.text or ""))
 def on_open_text(msg):
     uid = msg.from_user.id
+    if not storage.is_ai_enabled_for(uid):
+        storage.clear_progress_prefix(uid, "open_")
+        storage.set_progress(uid, "mode", "idle")
+        bot.send_message(msg.chat.id, AI_OFF_TEXT, reply_markup=kb_main())
+        return
     text = (msg.text or "").strip()
     mid = storage.get_progress(uid, "open_mod", "")
     lvl_s = storage.get_progress(uid, "open_lvl", "1")
@@ -727,9 +811,9 @@ def on_open_text(msg):
     except Exception:
         prev_best = -1
     if result_score > prev_best:
-        xp = 10 + result_score * 2
+        xp = xp_rules.module_writing_xp(result_score)
         storage.set_progress(uid, best_key, str(result_score))
-        storage.add_xp(uid, xp)
+        storage.award_xp(uid, xp, xp_rules.SRC_MODULE_WRITING, lesson_key=f"mod:{mid}:{lvl}")
     else:
         xp = 0
     if "no_error" in tags:
@@ -794,6 +878,7 @@ def _send_ctrl_q(chat_id, msg_id, uid):
     kb = InlineKeyboardMarkup(row_width=1)
     for i, o in enumerate(q["options"]):
         kb.add(InlineKeyboardButton(o, callback_data=f"ctrlans:{i}"))
+    kb.add(InlineKeyboardButton("⚠️ Ошибка в вопросе", callback_data=f"qreport:c:{mid}:{lvl}:{idx}"))
     bot.edit_message_text(f"📝 <b>Контрольная</b> ({idx+1}/{len(ctrl)})\n\n{safe_html(q['q'])}",
                           chat_id, msg_id, reply_markup=kb)
 
@@ -845,7 +930,7 @@ def _finish_ctrl(uid, chat_id, msg_id):
         storage.mark_level_ctrl_passed(uid, mid, lvl)
         xp_awarded = XP_CTRL if not already_passed else 0
         if xp_awarded:
-            storage.add_xp(uid, xp_awarded)
+            storage.award_xp(uid, xp_awarded, xp_rules.SRC_MODULE_CTRL, lesson_key=f"mod:{mid}:{lvl}")
         nxt = lvl + 1
         if nxt <= 3:
             storage.set_module_level_unlocked(uid, mid, nxt)
@@ -877,5 +962,13 @@ def fallback(msg):
 if __name__ == "__main__":
     storage.init_db()
     load_custom_lessons_from_db()  # Load admin-uploaded exercises
+    try:
+        # Разовый пересчёт истории XP по урокам (идемпотентно, срабатывает один раз).
+        stats = storage.backfill_xp_ledger_once()
+        if not stats.get("skipped"):
+            print(f"[xp] Backfill: users={stats['users']} "
+                  f"lesson_rows={stats['lesson_rows']} legacy_rows={stats['legacy_rows']}")
+    except Exception as e:
+        print(f"[xp] Backfill skipped due to error: {e}")
     print("Bot v3 (Dual-mode) running...")
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)

@@ -115,3 +115,51 @@ def truncate_text(text: str, limit: int = 3500) -> str:
     if len(t) <= limit:
         return t
     return t[: max(0, limit - 20)].rstrip() + "\n…(обрезано)…"
+
+
+# ── Человекочитаемые названия ключей уроков в журнале XP ─────────────────────
+def xp_lesson_label(lesson_key: str) -> str:
+    """'s1_09' → '1.9 Морфология…', 'mod:nouns:2' → '🧠 Существительные · ур.2',
+    'class:2026-03-04' → '📅 04.03 Тема', '' → 'Прочее', '__legacy__' → 'До обновления'."""
+    key = (lesson_key or "").strip()
+    if not key:
+        return "Прочее (вход, входной тест)"
+    if key == "__legacy__":
+        return "До обновления"
+
+    if key.startswith("mod:"):
+        parts = key.split(":")
+        mid = parts[1] if len(parts) > 1 else ""
+        lvl = parts[2] if len(parts) > 2 else ""
+        title = mid
+        try:
+            from content import MODULES
+            title = (MODULES.get(mid) or {}).get("title") or mid
+        except Exception:
+            pass
+        return f"🧠 {title} · ур.{lvl}" if lvl else f"🧠 {title}"
+
+    if key.startswith("class:"):
+        date = key.split(":", 1)[1]
+        title = ""
+        try:
+            from class_content import CLASS_SCHEDULE
+            lesson = next((l for l in CLASS_SCHEDULE if l.get("date") == date), None)
+            title = (lesson or {}).get("title") or ""
+        except Exception:
+            pass
+        try:
+            y, m, d = date.split("-")
+            date = f"{d}.{m}"
+        except Exception:
+            pass
+        return f"📅 {date} {title}".strip()
+
+    try:
+        from ktp_plan import LESSON_BY_ID
+        lesson = LESSON_BY_ID.get(key)
+        if lesson:
+            return f"{lesson.semester}.{lesson.num} {lesson.title}"
+    except Exception:
+        pass
+    return key

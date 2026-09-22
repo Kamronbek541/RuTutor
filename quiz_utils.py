@@ -15,18 +15,45 @@ def _norm(value: Any) -> str:
     return str(value or "").strip().casefold().replace("ё", "е")
 
 
-def _options(raw: Any) -> List[str]:
+def _dedupe_options(raw: Any) -> tuple[List[str], Dict[int, int]]:
+    """Убирает пустые и повторяющиеся варианты.
+
+    Возвращает (варианты, карта «старый индекс → новый»). Карта нужна, чтобы
+    целочисленный `correct` не съехал на соседний вариант, когда перед ним
+    удалили дубликат (в том числе дубликат по ё-нормализации: сёстры/сестры).
+    """
     if not isinstance(raw, list):
-        return []
+        return [], {}
     out: List[str] = []
-    seen = set()
-    for item in raw:
+    index_map: Dict[int, int] = {}
+    seen: Dict[str, int] = {}
+    for old_idx, item in enumerate(raw):
         text = str(item).strip()
+        if not text:
+            continue
         key = _norm(text)
-        if text and key not in seen:
-            out.append(text)
-            seen.add(key)
-    return out
+        if key in seen:
+            index_map[old_idx] = seen[key]
+            continue
+        seen[key] = len(out)
+        index_map[old_idx] = len(out)
+        out.append(text)
+    return out, index_map
+
+
+def _remap_correct(raw: Any, index_map: Dict[int, int]) -> Any:
+    """Переносит целочисленный `correct` с исходного списка на дедуплицированный."""
+    if isinstance(raw, bool):
+        return raw
+    try:
+        raw_idx = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return raw
+    return index_map.get(raw_idx, raw_idx)
+
+
+def _options(raw: Any) -> List[str]:
+    return _dedupe_options(raw)[0]
 
 
 def _coerce_correct_idx(raw: Any, options: List[str]) -> Optional[int]:
@@ -120,10 +147,10 @@ def _known_repair(question: Dict[str, Any], options: List[str]) -> Optional[Dict
 
 
 def safe_correct_idx(question: Dict[str, Any]) -> int:
-    options = _options(question.get("options", []))
+    options, index_map = _dedupe_options(question.get("options", []))
     if not options:
         return 0
-    idx = _coerce_correct_idx(question.get("correct", 0), options)
+    idx = _coerce_correct_idx(_remap_correct(question.get("correct", 0), index_map), options)
     return idx if idx is not None else 0
 
 
@@ -132,13 +159,13 @@ def normalize_mcq(question: Dict[str, Any], fallback_id: str = "q1") -> Dict[str
     q.setdefault("id", fallback_id)
     q["q"] = str(q.get("q", "") or "").strip() or "Выберите правильный ответ."
 
-    options = _options(q.get("options", []))
+    options, index_map = _dedupe_options(q.get("options", []))
     repaired = _known_repair(q, options)
     if repaired:
         q = repaired
-        options = _options(q.get("options", []))
+        options, index_map = _dedupe_options(q.get("options", []))
 
-    idx = _coerce_correct_idx(q.get("correct", 0), options)
+    idx = _coerce_correct_idx(_remap_correct(q.get("correct", 0), index_map), options)
     if idx is None:
         raw = q.get("correct", "")
         if isinstance(raw, str) and raw.strip() and not raw.strip().isdigit():
