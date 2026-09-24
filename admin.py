@@ -33,7 +33,8 @@ def _parse_ids(env_val: str) -> set[int]:
 
 # Read from .env; fallback to hardcoded defaults
 _env_admins = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = _parse_ids(_env_admins) if _env_admins.strip() else {460793063, 502483421, 107713886}
+ADMIN_IDS_FROM_ENV = bool(_env_admins.strip())
+ADMIN_IDS = _parse_ids(_env_admins) if ADMIN_IDS_FROM_ENV else {460793063, 502483421, 107713886}
 
 
 def is_admin(user_id: int) -> bool:
@@ -1093,6 +1094,15 @@ def register_join_commands(bot):
         buttons = [(f"🏫 {g['name']}", f"teach:group:{g['group_id']}") for g in groups]
         return "\n".join(lines), _kb_one_col(buttons) if buttons else None
 
+    @bot.message_handler(commands=["myid"])
+    def on_myid(msg):
+        """Свой Telegram ID — нужен, чтобы правильно заполнить ADMIN_IDS."""
+        bot.reply_to(
+            msg,
+            f"Ваш Telegram ID: <code>{msg.from_user.id}</code>",
+            parse_mode="HTML",
+        )
+
     @bot.message_handler(commands=["teacher"])
     def on_teacher(msg):
         storage.init_db()
@@ -1393,7 +1403,13 @@ def register_prewarm_command(bot):
             f"Записей в журнале XP: <b>{status['xp_ledger_rows']}</b>\n"
             f"Жалоб на вопросы: <b>{status['question_reports']}</b>\n"
             f"Размер файла: <b>{round(health['size_bytes'] / 1024)} КБ</b>\n\n"
-            "Резервная копия: /dbbackup",
+            f"Администраторы ({len(ADMIN_IDS)}): <code>"
+            + ", ".join(str(i) for i in sorted(ADMIN_IDS)) + "</code>\n"
+            + ("Источник: переменная ADMIN_IDS\n"
+               if ADMIN_IDS_FROM_ENV else
+               "⚠️ ADMIN_IDS не задана — используется список по умолчанию.\n"
+               "Эти люди видят админ-панель и получают жалобы на вопросы.\n")
+            + "\nРезервная копия: /dbbackup",
             parse_mode="HTML",
         )
 

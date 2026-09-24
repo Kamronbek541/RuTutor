@@ -964,11 +964,15 @@ EPHEMERAL_WARN_INTERVAL = 12 * 3600  # не чаще раза в 12 часов
 
 
 def _warn_if_storage_is_ephemeral():
-    """Громко предупредить, если база лежит на временном диске контейнера.
+    """Предупредить, если база лежит на временном диске контейнера.
 
-    Без подключённого Volume каждый деплой стирает учеников, XP и кеш уроков.
-    В логи пишем всегда, админам — не чаще раза в 12 часов, чтобы перезапуски
-    процесса не превращались в поток одинаковых сообщений.
+    Это техническое сообщение для владельца, а не для учеников, поэтому оно
+    идёт ТОЛЬКО в логи. Никаких рассылок в Telegram: администраторами могут
+    числиться обычные люди, и им такие сообщения ни к чему.
+
+    Посмотреть статус в любой момент: команда /dbstatus.
+    Если всё же нужно уведомление в Telegram — задайте RUTUTOR_ALERT_CHAT_ID
+    с ID одного чата (своего), тогда предупреждение придёт не чаще раза в 12 часов.
     """
     health = storage.storage_health()
     print(f"[db] {health['db_path']} (persistent={health['persistent']})")
@@ -981,7 +985,12 @@ def _warn_if_storage_is_ephemeral():
     print("[db] Решение: подключите Volume к сервису (Railway → Settings → Volumes),")
     print("[db] точка монтирования /data. Бот подхватит его автоматически.")
     print("[db] Либо задайте RUTUTOR_DATA_DIR с путём внутри тома.")
+    print("[db] Проверить из Telegram: /dbstatus")
     print("=" * 70)
+
+    alert_chat = (os.getenv("RUTUTOR_ALERT_CHAT_ID") or "").strip()
+    if not alert_chat:
+        return
 
     now = int(datetime.now().timestamp())
     try:
@@ -989,24 +998,21 @@ def _warn_if_storage_is_ephemeral():
     except ValueError:
         last = 0
     if now - last < EPHEMERAL_WARN_INTERVAL:
-        print("[db] Админам уже сообщали недавно — сообщение не дублируем.")
         return
     storage.set_meta(EPHEMERAL_WARN_KEY, str(now))
 
-    for admin_id in set(ADMIN_IDS):
-        try:
-            bot.send_message(
-                admin_id,
-                "⚠️ <b>База на временном диске</b>\n\n"
-                f"Путь: <code>{health['db_path']}</code>\n\n"
-                "При следующем деплое пропадут ученики, XP и классы.\n"
-                "Подключите Volume к сервису (точка монтирования <code>/data</code>) — "
-                "бот подхватит его сам.\n\n"
-                "Проверить: /dbstatus · Резервная копия: /dbbackup",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+    try:
+        bot.send_message(
+            int(alert_chat),
+            "⚠️ <b>База на временном диске</b>\n\n"
+            f"Путь: <code>{health['db_path']}</code>\n\n"
+            "При следующем деплое пропадут ученики, XP и классы.\n"
+            "Подключите Volume к сервису (точка монтирования <code>/data</code>).\n\n"
+            "Проверить: /dbstatus · Резервная копия: /dbbackup",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
