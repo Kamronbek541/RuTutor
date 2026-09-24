@@ -959,15 +959,22 @@ def _finish_ctrl(uid, chat_id, msg_id):
 def fallback(msg):
     bot.send_message(msg.chat.id, "Напиши /start или используй кнопки меню.", reply_markup=kb_main())
 
+EPHEMERAL_WARN_KEY = "ephemeral_storage_warned_ts"
+EPHEMERAL_WARN_INTERVAL = 12 * 3600  # не чаще раза в 12 часов
+
+
 def _warn_if_storage_is_ephemeral():
     """Громко предупредить, если база лежит на временном диске контейнера.
 
     Без подключённого Volume каждый деплой стирает учеников, XP и кеш уроков.
+    В логи пишем всегда, админам — не чаще раза в 12 часов, чтобы перезапуски
+    процесса не превращались в поток одинаковых сообщений.
     """
     health = storage.storage_health()
     print(f"[db] {health['db_path']} (persistent={health['persistent']})")
     if health["persistent"]:
         return
+
     print("=" * 70)
     print("[db] ВНИМАНИЕ: база лежит на ВРЕМЕННОМ диске контейнера.")
     print("[db] При следующем деплое пропадут ученики, XP, классы и кеш уроков.")
@@ -975,7 +982,18 @@ def _warn_if_storage_is_ephemeral():
     print("[db] точка монтирования /data. Бот подхватит его автоматически.")
     print("[db] Либо задайте RUTUTOR_DATA_DIR с путём внутри тома.")
     print("=" * 70)
-    for admin_id in ADMIN_IDS:
+
+    now = int(datetime.now().timestamp())
+    try:
+        last = int(storage.get_meta(EPHEMERAL_WARN_KEY, "0") or 0)
+    except ValueError:
+        last = 0
+    if now - last < EPHEMERAL_WARN_INTERVAL:
+        print("[db] Админам уже сообщали недавно — сообщение не дублируем.")
+        return
+    storage.set_meta(EPHEMERAL_WARN_KEY, str(now))
+
+    for admin_id in set(ADMIN_IDS):
         try:
             bot.send_message(
                 admin_id,
@@ -983,7 +1001,8 @@ def _warn_if_storage_is_ephemeral():
                 f"Путь: <code>{health['db_path']}</code>\n\n"
                 "При следующем деплое пропадут ученики, XP и классы.\n"
                 "Подключите Volume к сервису (точка монтирования <code>/data</code>) — "
-                "бот подхватит его сам.",
+                "бот подхватит его сам.\n\n"
+                "Проверить: /dbstatus · Резервная копия: /dbbackup",
                 parse_mode="HTML",
             )
         except Exception:
