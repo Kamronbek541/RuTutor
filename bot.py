@@ -1,4 +1,5 @@
 # bot.py — Dual-mode Russian Language Tutor v3
+import logging
 import os, json
 from datetime import datetime
 from dotenv import load_dotenv
@@ -21,6 +22,14 @@ import xp_rules
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in .env — bot cannot start.")
+
+# Логи в stdout, чтобы ошибки обработчиков были видны в логах хостинга,
+# а не терялись молча (симптом «нажимаю кнопку — ничего не происходит»).
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+telebot.logger.setLevel(logging.INFO)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 from admin import ADMIN_IDS  # single source of truth
@@ -959,6 +968,21 @@ def _finish_ctrl(uid, chat_id, msg_id):
 def fallback(msg):
     bot.send_message(msg.chat.id, "Напиши /start или используй кнопки меню.", reply_markup=kb_main())
 
+
+# Регистрируется последним: срабатывает только если кнопку не обработал никто.
+# Раньше такое нажатие проваливалось в тишину — пользователю казалось, что бот завис.
+@bot.callback_query_handler(func=lambda c: True)
+def on_unknown_callback(call):
+    logging.warning("Необработанный callback: %r от %s", call.data, call.from_user.id)
+    try:
+        bot.answer_callback_query(
+            call.id,
+            "⏳ Кнопка устарела — бот успел обновиться.\nНажмите /start и попробуйте снова.",
+            show_alert=True,
+        )
+    except Exception:
+        pass
+
 EPHEMERAL_WARN_KEY = "ephemeral_storage_warned_ts"
 EPHEMERAL_WARN_INTERVAL = 12 * 3600  # не чаще раза в 12 часов
 
@@ -1027,5 +1051,8 @@ if __name__ == "__main__":
                   f"lesson_rows={stats['lesson_rows']} legacy_rows={stats['legacy_rows']}")
     except Exception as e:
         print(f"[xp] Backfill skipped due to error: {e}")
-    print("Bot v3 (Dual-mode) running...")
+    commit = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "")[:7] or "local"
+    print(f"Bot v3 (Dual-mode) running... commit={commit}")
+    print("[bot] Если ниже появится 409 Conflict — значит запущен второй экземпляр "
+          "с тем же BOT_TOKEN, и кнопки будут срабатывать через раз.")
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=25)
