@@ -491,7 +491,12 @@ def register(bot):
         lines = ["👥 <b>Участники</b>\n"]
         for m in members[:40]:
             role = "👩‍🏫" if m.get("role") == "teacher" else "👤"
-            lines.append(f"{role} {m.get('first_name','')} (@{m.get('username','')}) — XP {m.get('xp',0)}")
+            # Имя пустое, пока человек не нажал /start — показываем хотя бы ID.
+            name = (m.get("first_name") or "").strip() or f"ID {m.get('user_id')}"
+            handle = (m.get("username") or "").strip()
+            handle = f" (@{handle})" if handle else ""
+            hint = "" if (m.get("first_name") or "").strip() else " · ещё не открывал бота"
+            lines.append(f"{role} {safe_html(name)}{safe_html(handle)} — XP {m.get('xp', 0)}{hint}")
         bot.edit_message_text(
             "\n".join(lines),
             call.message.chat.id,
@@ -1048,6 +1053,7 @@ def register_join_commands(bot):
             bot.reply_to(msg, "Используй: <code>/join ABC123</code>", parse_mode="HTML")
             return
         code = args[1].strip().upper()
+        storage.upsert_user(msg.from_user.id, msg.from_user.first_name, msg.from_user.username)
         g = storage.join_group_by_code(msg.from_user.id, code, role="student")
         if not g:
             bot.reply_to(msg, "Код не найден. Проверь и попробуй снова.")
@@ -1068,6 +1074,7 @@ def register_join_commands(bot):
             bot.send_message(msg.chat.id, "Используй: <code>/teach ABC123</code>", parse_mode="HTML")
             return
         code = args[1].strip().upper()
+        storage.upsert_user(msg.from_user.id, msg.from_user.first_name, msg.from_user.username)
         g = storage.join_group_by_code(msg.from_user.id, code, role="teacher")
         if not g:
             bot.send_message(msg.chat.id, "Код не найден. Проверь и попробуй снова.")

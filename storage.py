@@ -512,6 +512,19 @@ def upsert_user(user_id: int, first_name: str, username: str):
         con.commit()
 
 
+def ensure_user(user_id: int) -> None:
+    """Создать строку пользователя, если её ещё нет, не затирая имя и XP."""
+    con = _get_con()
+    with _lock:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO users(user_id, first_name, username, created_ts)"
+            " VALUES (?, '', '', ?)",
+            (user_id, _now_ts()),
+        )
+        con.commit()
+
+
 def get_user(user_id: int) -> Optional[Dict[str, Any]]:
     con = _get_con()
     con.row_factory = sqlite3.Row
@@ -1231,9 +1244,12 @@ def add_member(group_id: int, user_id: int, role: str = "student") -> None:
 
 
 def join_group_by_code(user_id: int, code: str, role: str = "student") -> Optional[Dict[str, Any]]:
+    """Вступить в класс по коду. Строка в users создаётся сразу, иначе участник
+    без единого /start остаётся «призраком» и ломает отчёты по классу."""
     g = get_group_by_code(code)
     if not g:
         return None
+    ensure_user(user_id)
     add_member(int(g["group_id"]), user_id, role=role)
     return g
 
@@ -1259,12 +1275,17 @@ def get_group_members(group_id: int) -> List[Dict[str, Any]]:
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     cur.execute("""
-        SELECT u.user_id, u.first_name, u.username, u.xp, u.streak, u.language_level,
+        SELECT gm.user_id AS user_id,
+               COALESCE(u.first_name, '') AS first_name,
+               COALESCE(u.username, '') AS username,
+               COALESCE(u.xp, 0) AS xp,
+               COALESCE(u.streak, 0) AS streak,
+               COALESCE(u.language_level, 'NA') AS language_level,
                gm.role, gm.joined_ts
         FROM group_members gm
         LEFT JOIN users u ON u.user_id = gm.user_id
         WHERE gm.group_id=?
-        ORDER BY gm.role DESC, u.xp DESC
+        ORDER BY gm.role DESC, COALESCE(u.xp, 0) DESC
     """, (group_id,))
     rows = [dict(r) for r in cur.fetchall()]
     con.row_factory = None
