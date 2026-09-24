@@ -5,6 +5,7 @@ import os
 import csv
 import json
 import tempfile
+import time
 from datetime import datetime
 from typing import Optional, List
 
@@ -1436,6 +1437,81 @@ def register_prewarm_command(bot):
                          "Чтобы восстановить: положите файл на сервер и укажите путь "
                          "в RUTUTOR_LEGACY_DB_PATH."),
             )
+
+    # Разовая уборка технических сообщений, которые бот успел разослать
+    # администраторам до того, как рассылку убрали.
+    ALERT_MARKER = "База на временном диске"
+    CLEANUP_SCAN_DEPTH = 40      # сколько последних сообщений просматривать в чате
+    CLEANUP_PAUSE = 0.2          # пауза между запросами, чтобы не поймать лимит Telegram
+
+    @bot.message_handler(commands=["cleanup_alerts"])
+    def on_cleanup_alerts(msg):
+        """Удалить у администраторов сообщения «База на временном диске».
+
+        Telegram не даёт боту читать историю чата, поэтому каждое сообщение
+        сначала пересылается сюда (только так видно текст), пересылка тут же
+        удаляется, и оригинал удаляется ТОЛЬКО если текст совпал с шаблоном.
+        Чужие сообщения и другие сообщения бота не трогаются.
+
+        Ограничение Telegram: удалять можно только то, что отправлено
+        менее 48 часов назад.
+        """
+        uid = msg.from_user.id
+        if not is_admin(uid):
+            bot.reply_to(msg, "⛔️ Доступ запрещён.")
+            return
+
+        status = bot.reply_to(msg, "🧹 Ищу технические сообщения у администраторов…")
+        report = []
+        total = 0
+
+        for chat_id in sorted(ADMIN_IDS):
+            try:
+                probe = bot.send_message(chat_id, "🧹")
+            except Exception as e:
+                report.append(f"• <code>{chat_id}</code> — чат недоступен ({type(e).__name__})")
+                continue
+
+            max_id = probe.message_id
+            try:
+                bot.delete_message(chat_id, max_id)
+            except Exception:
+                pass
+
+            removed = 0
+            for mid in range(max_id - 1, max(1, max_id - CLEANUP_SCAN_DEPTH), -1):
+                try:
+                    fwd = bot.forward_message(msg.chat.id, chat_id, mid)
+                except Exception:
+                    continue
+                text = (fwd.text or fwd.caption or "")
+                try:
+                    bot.delete_message(msg.chat.id, fwd.message_id)
+                except Exception:
+                    pass
+                if ALERT_MARKER in text:
+                    try:
+                        bot.delete_message(chat_id, mid)
+                        removed += 1
+                    except Exception:
+                        pass  # старше 48 часов — удалить уже нельзя
+                time.sleep(CLEANUP_PAUSE)
+
+            total += removed
+            report.append(f"• <code>{chat_id}</code> — удалено: <b>{removed}</b>")
+
+        try:
+            bot.delete_message(msg.chat.id, status.message_id)
+        except Exception:
+            pass
+
+        bot.send_message(
+            msg.chat.id,
+            "🧹 <b>Уборка технических сообщений</b>\n\n" + "\n".join(report) +
+            f"\n\nВсего удалено: <b>{total}</b>\n"
+            "<i>Сообщения старше 48 часов Telegram удалять не разрешает.</i>",
+            parse_mode="HTML",
+        )
 
     @bot.message_handler(commands=["xp_backfill"])
     def on_xp_backfill(msg):
