@@ -1373,18 +1373,53 @@ def register_prewarm_command(bot):
             return
 
         status = storage.get_db_status()
+        health = storage.storage_health()
+        if health["persistent"]:
+            persistence = "✅ постоянное хранилище — деплой данные не сотрёт"
+        else:
+            persistence = (
+                "⛔️ <b>ВРЕМЕННЫЙ диск!</b> При следующем деплое данные пропадут.\n"
+                "Подключите Volume к сервису, точка монтирования <code>/data</code>."
+            )
         bot.reply_to(
             msg,
             "<b>💾 База RuTutor</b>\n\n"
+            f"{persistence}\n\n"
             f"Путь: <code>{status['db_path']}</code>\n"
             f"Пользователи: <b>{status['users']}</b>\n"
             f"Сохранённые уроки: <b>{status['cached_lessons']}</b>\n"
             f"Доп. темы: <b>{status['custom_topics']}</b>\n"
             f"Строки прогресса КТП: <b>{status['ktp_progress_rows']}</b>\n"
             f"Записей в журнале XP: <b>{status['xp_ledger_rows']}</b>\n"
-            f"Жалоб на вопросы: <b>{status['question_reports']}</b>",
+            f"Жалоб на вопросы: <b>{status['question_reports']}</b>\n"
+            f"Размер файла: <b>{round(health['size_bytes'] / 1024)} КБ</b>\n\n"
+            "Резервная копия: /dbbackup",
             parse_mode="HTML",
         )
+
+    @bot.message_handler(commands=["dbbackup"])
+    def on_dbbackup(msg):
+        """Прислать файл базы в чат — страховка перед деплоем или переездом."""
+        uid = msg.from_user.id
+        if not is_admin(uid):
+            bot.reply_to(msg, "⛔️ Доступ запрещён.")
+            return
+        src = storage.get_db_path()
+        if not os.path.exists(src):
+            bot.reply_to(msg, "База ещё не создана.")
+            return
+        # Копируем через SQLite backup: файл под WAL нельзя копировать «как есть».
+        dst = os.path.join(tempfile.gettempdir(), f"rututor_backup_{_now_ymd()}.db")
+        if not storage.backup_db_to(dst):
+            bot.reply_to(msg, "Не удалось сделать копию базы.")
+            return
+        with open(dst, "rb") as f:
+            bot.send_document(
+                msg.chat.id, f,
+                caption=("💾 Резервная копия базы RuTutor\n"
+                         "Чтобы восстановить: положите файл на сервер и укажите путь "
+                         "в RUTUTOR_LEGACY_DB_PATH."),
+            )
 
     @bot.message_handler(commands=["xp_backfill"])
     def on_xp_backfill(msg):

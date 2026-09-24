@@ -15,11 +15,50 @@ from typing import Optional, Dict, Any, List, Tuple
 DB_FILENAME = "bot.db"
 
 
+# Каталоги, которые переживают перезапуск контейнера, если к сервису
+# подключён диск (Railway Volume, Docker volume и т.п.).
+VOLUME_CANDIDATES = ("/data", "/mnt/data", "/var/data", "/app/data")
+
+
+def _writable_dir(path: Path) -> bool:
+    """Каталог существует (или создаётся) и в него действительно можно писать."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".rututor_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def _volume_data_dir() -> Optional[Path]:
+    """Подключённый постоянный диск, если он есть.
+
+    На Railway при подключении Volume появляется RAILWAY_VOLUME_MOUNT_PATH.
+    Дополнительно проверяем типовые точки монтирования — иначе база окажется
+    на временном диске контейнера и сотрётся при следующем деплое.
+    """
+    mount = (os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "").strip()
+    if mount and _writable_dir(Path(mount)):
+        return Path(mount) / "rututor"
+
+    for candidate in VOLUME_CANDIDATES:
+        path = Path(candidate)
+        if path.is_dir() and _writable_dir(path):
+            return path / "rututor"
+    return None
+
+
 def _default_data_dir() -> Path:
     """Stable data folder outside release zips, so updates keep XP/cache."""
     explicit = os.getenv("RUTUTOR_DATA_DIR", "").strip()
     if explicit:
         return Path(explicit).expanduser()
+
+    volume = _volume_data_dir()
+    if volume is not None:
+        return volume
 
     if os.name == "nt":
         base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
@@ -38,6 +77,60 @@ def _resolve_db_path() -> Path:
 
 DB_PATH = str(_resolve_db_path())
 _db_file_ready = False
+
+
+def is_persistent_storage() -> bool:
+    """Лежит ли база на диске, который переживёт перезапуск/деплой.
+
+    На сервере без подключённого Volume ответ False — значит при каждом деплое
+    пропадут ученики, XP и кеш уроков.
+    """
+    if os.name == "nt" or not _is_container():
+        return True  # локальный запуск: диск обычный, данные не исчезают
+
+    # Путь задан вручную — считаем, что владелец знает, куда смонтирован диск.
+    if (os.getenv("RUTUTOR_DATA_DIR") or os.getenv("RUTUTOR_DB_PATH")
+            or os.getenv("BOT_DB_PATH") or "").strip():
+        return True
+
+    db_path = Path(DB_PATH).expanduser().resolve()
+    mount = (os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "").strip()
+    roots = [Path(mount)] if mount else []
+    roots += [Path(c) for c in VOLUME_CANDIDATES]
+    for root in roots:
+        try:
+            db_path.relative_to(root.resolve())
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_container() -> bool:
+    """Грубая, но надёжная проверка «мы внутри контейнера/на сервере»."""
+    if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_PROJECT_ID"):
+        return True
+    if os.getenv("RUTUTOR_ASSUME_CONTAINER") == "1":
+        return True
+    return Path("/.dockerenv").exists()
+
+
+def storage_health() -> Dict[str, Any]:
+    """Короткая сводка о хранилище — для логов и админ-команды /dbstatus."""
+    path = Path(DB_PATH).expanduser()
+    size = 0
+    try:
+        size = path.stat().st_size
+    except Exception:
+        pass
+    return {
+        "db_path": str(path),
+        "exists": path.exists(),
+        "size_bytes": size,
+        "persistent": is_persistent_storage(),
+        "volume_mount": (os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "").strip(),
+        "in_container": _is_container(),
+    }
 
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no confusing 0/O/1/I
 
@@ -62,6 +155,11 @@ def _legacy_db_candidates(target: Path) -> List[Path]:
 
     here = Path(__file__).resolve().parent
     roots = [Path.cwd(), here, here.parent, Path.cwd().parent]
+    # Прежнее «постоянное» место до появления поддержки Volume.
+    try:
+        candidates.append(Path.home() / ".rututor" / DB_FILENAME)
+    except Exception:
+        pass
     for root in roots:
         candidates.append(root / DB_FILENAME)
         try:
@@ -1578,3 +1676,22 @@ def backfill_xp_ledger_once(force: bool = False) -> Dict[str, int]:
 
     set_meta(XP_BACKFILL_KEY, str(_now_ts()))
     return stats
+
+
+def backup_db_to(dst_path: str) -> bool:
+    """Скопировать базу через SQLite backup (безопасно при включённом WAL)."""
+    try:
+        src = Path(get_db_path())
+        if not src.exists():
+            return False
+        dst = Path(dst_path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            dst.unlink()
+        with _lock:
+            dst_con = sqlite3.connect(str(dst))
+            _get_con().backup(dst_con)
+            dst_con.close()
+        return True
+    except Exception:
+        return False

@@ -959,8 +959,40 @@ def _finish_ctrl(uid, chat_id, msg_id):
 def fallback(msg):
     bot.send_message(msg.chat.id, "Напиши /start или используй кнопки меню.", reply_markup=kb_main())
 
+def _warn_if_storage_is_ephemeral():
+    """Громко предупредить, если база лежит на временном диске контейнера.
+
+    Без подключённого Volume каждый деплой стирает учеников, XP и кеш уроков.
+    """
+    health = storage.storage_health()
+    print(f"[db] {health['db_path']} (persistent={health['persistent']})")
+    if health["persistent"]:
+        return
+    print("=" * 70)
+    print("[db] ВНИМАНИЕ: база лежит на ВРЕМЕННОМ диске контейнера.")
+    print("[db] При следующем деплое пропадут ученики, XP, классы и кеш уроков.")
+    print("[db] Решение: подключите Volume к сервису (Railway → Settings → Volumes),")
+    print("[db] точка монтирования /data. Бот подхватит его автоматически.")
+    print("[db] Либо задайте RUTUTOR_DATA_DIR с путём внутри тома.")
+    print("=" * 70)
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(
+                admin_id,
+                "⚠️ <b>База на временном диске</b>\n\n"
+                f"Путь: <code>{health['db_path']}</code>\n\n"
+                "При следующем деплое пропадут ученики, XP и классы.\n"
+                "Подключите Volume к сервису (точка монтирования <code>/data</code>) — "
+                "бот подхватит его сам.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     storage.init_db()
+    _warn_if_storage_is_ephemeral()
     load_custom_lessons_from_db()  # Load admin-uploaded exercises
     try:
         # Разовый пересчёт истории XP по урокам (идемпотентно, срабатывает один раз).
