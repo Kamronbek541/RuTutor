@@ -1215,6 +1215,25 @@ def get_group(group_id: int) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def delete_group(group_id: int) -> bool:
+    """Удалить класс: сам класс, его участников и настройки.
+
+    XP и прогресс учеников НЕ трогаем — они живут в users/xp_ledger и не
+    привязаны к классу, поэтому ученик ничего не теряет.
+    """
+    con = _get_con()
+    with _lock:
+        cur = con.cursor()
+        cur.execute("SELECT 1 FROM groups WHERE group_id=?", (int(group_id),))
+        if not cur.fetchone():
+            return False
+        cur.execute("DELETE FROM group_members WHERE group_id=?", (int(group_id),))
+        cur.execute("DELETE FROM group_settings WHERE group_id=?", (int(group_id),))
+        cur.execute("DELETE FROM groups WHERE group_id=?", (int(group_id),))
+        con.commit()
+    return True
+
+
 def get_group_by_code(code: str) -> Optional[Dict[str, Any]]:
     code = (code or "").strip().upper()
     if not code:

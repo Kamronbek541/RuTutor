@@ -230,6 +230,9 @@ def register(bot):
         if not is_admin(uid):
             bot.answer_callback_query(call.id); return
         bot.answer_callback_query(call.id)
+        _render_groups_list(call)
+
+    def _render_groups_list(call):
         groups = storage.list_groups()
         buttons = []
         for g in groups[:25]:
@@ -323,9 +326,51 @@ def register(bot):
                 ("📤 Экспорт XP по урокам", f"admin:export_group_xp:{gid}"),
                 ("📤 Экспорт прогресса (КТП)", f"admin:export_group_progress:{gid}"),
                 ("📤 Экспорт участников", f"admin:export_group:{gid}"),
+                ("🗑 Удалить класс", f"admin:group_del:{gid}"),
                 ("🏫 К списку классов", "admin:groups"),
             ]),
         )
+
+    # ── Удаление класса (с подтверждением) ────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:group_del:"))
+    def on_group_delete_confirm(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        bot.answer_callback_query(call.id)
+        gid = int(call.data.split(":")[2])
+        g = storage.get_group(gid)
+        if not g:
+            bot.edit_message_text("Класс не найден.", call.message.chat.id, call.message.message_id)
+            return
+        summary = storage.get_group_summary(gid)
+        bot.edit_message_text(
+            f"🗑 <b>Удалить класс «{safe_html(g['name'])}»?</b>\n\n"
+            f"Учеников в классе: <b>{summary['students']}</b>\n"
+            f"Код <code>{g['join_code']}</code> перестанет работать.\n\n"
+            "XP и прогресс учеников <b>сохранятся</b> — они не привязаны к классу.\n"
+            "Пропадут только сам класс, список участников и его настройки.\n\n"
+            "<i>Действие необратимо.</i>",
+            call.message.chat.id, call.message.message_id, parse_mode="HTML",
+            reply_markup=_kb_one_col([
+                ("🗑 Да, удалить класс", f"admin:group_del_yes:{gid}"),
+                ("⬅️ Отмена", f"admin:group:{gid}"),
+            ]),
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:group_del_yes:"))
+    def on_group_delete(call):
+        if not is_admin(call.from_user.id):
+            bot.answer_callback_query(call.id); return
+        gid = int(call.data.split(":")[2])
+        g = storage.get_group(gid)
+        name = g["name"] if g else str(gid)
+        ok = storage.delete_group(gid)
+        bot.answer_callback_query(
+            call.id,
+            f"Класс «{name}» удалён." if ok else "Класс уже удалён.",
+            show_alert=True,
+        )
+        _render_groups_list(call)
 
     # ── XP по урокам ──────────────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:group_xp:"))
@@ -458,7 +503,7 @@ def register(bot):
                 buttons.append((f"✅ Обработано #{r['id']}", f"admin:report_done:{r['id']}"))
         buttons.append(("🗂 Показать все", "admin:reports:all") if status == "new"
                        else ("🆕 Только новые", "admin:reports:new"))
-        buttons.append(("⬅️ В админ-панель", "admin:home"))
+        buttons.append(("⬅️ В админ-панель", "admin:menu"))
         bot.edit_message_text("\n".join(lines)[:4000], call.message.chat.id,
                               call.message.message_id, parse_mode="HTML",
                               reply_markup=_kb_one_col(buttons))
@@ -470,15 +515,6 @@ def register(bot):
         storage.resolve_question_report(int(call.data.split(":")[2]))
         bot.answer_callback_query(call.id, "Отмечено как обработанное.")
         _render_reports(call, "new")
-
-    @bot.callback_query_handler(func=lambda c: c.data == "admin:home")
-    def on_admin_home(call):
-        if not is_admin(call.from_user.id):
-            bot.answer_callback_query(call.id); return
-        bot.answer_callback_query(call.id)
-        bot.edit_message_text("🛠 <b>Админ-панель</b>\n\nВыбери действие:",
-                              call.message.chat.id, call.message.message_id,
-                              parse_mode="HTML", reply_markup=_admin_menu_kb())
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("admin:group_members:"))
     def on_group_members(call):

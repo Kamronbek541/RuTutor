@@ -8,6 +8,7 @@ load_dotenv()
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+import auto_backup
 import storage, class_handlers
 import admin
 import ktp_handlers
@@ -1051,6 +1052,7 @@ if __name__ == "__main__":
                   f"lesson_rows={stats['lesson_rows']} legacy_rows={stats['legacy_rows']}")
     except Exception as e:
         print(f"[xp] Backfill skipped due to error: {e}")
+    auto_backup.start(bot)
     commit = (os.getenv("RAILWAY_GIT_COMMIT_SHA") or "")[:7] or "local"
     print(f"Bot v3 (Dual-mode) running... commit={commit}")
     print("[bot] Если ниже появится 409 Conflict — значит запущен второй экземпляр "
